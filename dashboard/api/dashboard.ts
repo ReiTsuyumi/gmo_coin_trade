@@ -17,6 +17,7 @@ const envFile = () => path.resolve(process.env.BOT_ENV_FILE || "../gmo-trading-b
 const MAX_LOG_BYTES = 4 * 1024 * 1024;
 const SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols";
 const SYMBOLS_TIMEOUT_MS = 5_000;
+const OFFICIAL_SYMBOLS_CACHE_MS = 5 * 60 * 1000;
 const DEMO_REFERENCE_TIME = Date.now();
 const DEFAULT_TRADE_CRON = "0 * * * *";
 const CRON_TIME_ZONE = "Asia/Tokyo";
@@ -243,7 +244,15 @@ async function readPublicSettings() {
   }
 }
 
-async function readOfficialSymbols(): Promise<string[]> {
+let officialSymbolsCache: { symbols: string[]; fetchedAt: number } | null = null;
+let officialSymbolsRequest: Promise<string[]> | null = null;
+
+export function resetOfficialSymbolsCacheForTests(): void {
+  officialSymbolsCache = null;
+  officialSymbolsRequest = null;
+}
+
+async function fetchOfficialSymbols(): Promise<string[]> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SYMBOLS_TIMEOUT_MS);
   try {
@@ -265,6 +274,28 @@ async function readOfficialSymbols(): Promise<string[]> {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function readOfficialSymbols(): Promise<string[]> {
+  if (officialSymbolsCache && Date.now() - officialSymbolsCache.fetchedAt < OFFICIAL_SYMBOLS_CACHE_MS) {
+    return officialSymbolsCache.symbols;
+  }
+  if (officialSymbolsRequest) return officialSymbolsRequest;
+
+  // Share one request across concurrent 10-second dashboard polls.
+  officialSymbolsRequest = fetchOfficialSymbols()
+    .then((symbols) => {
+      if (symbols.length) {
+        officialSymbolsCache = { symbols, fetchedAt: Date.now() };
+        return symbols;
+      }
+      // Keep the last successful list during a public API outage or rate limit.
+      return officialSymbolsCache?.symbols || [];
+    })
+    .finally(() => {
+      officialSymbolsRequest = null;
+    });
+  return officialSymbolsRequest;
 }
 
 async function systemStatus(): Promise<DashboardSnapshot["system"]> {
