@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { getDashboardSnapshot, parseCsv } from "./dashboard";
@@ -210,5 +210,64 @@ describe("dashboard snapshot", () => {
     expect(snapshot.bot.availableSymbols).toEqual(["BTC_JPY", "ETH_JPY", "XRP_JPY"]);
     expect(snapshot.bot.symbol).toBe("BTC_JPY");
     expect(snapshot.bot.health).toBe("waiting");
+  });
+
+  it("dataとlogsが存在しない場合は両方の接続失敗を返す", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+    const directory = await mkdtemp(path.join(tmpdir(), "gmo-dashboard-storage-missing-"));
+    temporaryDirectories.push(directory);
+    process.env.BOT_DATA_DIR = path.join(directory, "data");
+    process.env.BOT_LOG_DIR = path.join(directory, "logs");
+    process.env.BOT_ENV_FILE = path.join(directory, ".env");
+
+    const snapshot = await getDashboardSnapshot();
+
+    expect(snapshot.botStorage.data).toEqual({ connected: false, path: process.env.BOT_DATA_DIR });
+    expect(snapshot.botStorage.logs).toEqual({ connected: false, path: process.env.BOT_LOG_DIR });
+  });
+
+  it("空でも読み取れるdataとlogsは接続成功として扱う", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+    const directory = await mkdtemp(path.join(tmpdir(), "gmo-dashboard-storage-empty-"));
+    temporaryDirectories.push(directory);
+    process.env.BOT_DATA_DIR = path.join(directory, "data");
+    process.env.BOT_LOG_DIR = path.join(directory, "logs");
+    process.env.BOT_ENV_FILE = path.join(directory, ".env");
+    await Promise.all([mkdir(process.env.BOT_DATA_DIR), mkdir(process.env.BOT_LOG_DIR)]);
+
+    const snapshot = await getDashboardSnapshot();
+
+    expect(snapshot.botStorage.data.connected).toBe(true);
+    expect(snapshot.botStorage.logs.connected).toBe(true);
+  });
+
+  it("dataだけが読み取れない場合はdataのみ接続失敗を返す", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+    const directory = await mkdtemp(path.join(tmpdir(), "gmo-dashboard-storage-data-"));
+    temporaryDirectories.push(directory);
+    process.env.BOT_DATA_DIR = path.join(directory, "data");
+    process.env.BOT_LOG_DIR = path.join(directory, "logs");
+    process.env.BOT_ENV_FILE = path.join(directory, ".env");
+    await mkdir(process.env.BOT_LOG_DIR);
+
+    const snapshot = await getDashboardSnapshot();
+
+    expect(snapshot.botStorage.data.connected).toBe(false);
+    expect(snapshot.botStorage.logs.connected).toBe(true);
+  });
+
+  it("logsだけが読み取れない場合はlogsのみ接続失敗を返す", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("unavailable", { status: 503 })));
+    const directory = await mkdtemp(path.join(tmpdir(), "gmo-dashboard-storage-logs-"));
+    temporaryDirectories.push(directory);
+    process.env.BOT_DATA_DIR = path.join(directory, "data");
+    process.env.BOT_LOG_DIR = path.join(directory, "logs");
+    process.env.BOT_ENV_FILE = path.join(directory, ".env");
+    await mkdir(process.env.BOT_DATA_DIR);
+
+    const snapshot = await getDashboardSnapshot();
+
+    expect(snapshot.botStorage.data.connected).toBe(true);
+    expect(snapshot.botStorage.logs.connected).toBe(false);
   });
 });

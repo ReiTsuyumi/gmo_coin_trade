@@ -211,6 +211,12 @@ export default function Home() {
     retry: 1,
   });
   const data = query.data;
+  const storageErrors = data
+    ? (["data", "logs"] as const).filter((name) => !data.botStorage[name].connected)
+    : [];
+  const storageErrorPath = data
+    ? storageErrors.map((name) => `${name}: ${data.botStorage[name].path}`).join("\n")
+    : "";
 
   return (
     <div className="app-shell">
@@ -235,6 +241,12 @@ export default function Home() {
               <h1>{view === "overview" ? "運用ダッシュボード" : "判断・注文ログ"}</h1>
               {data ? <span className={`mode-badge ${data.bot.mode === "live" ? "live" : ""}`}>{data.bot.mode === "live" ? "LIVE" : "テストモード"}</span> : null}
             </div>
+            {storageErrors.length > 0 ? (
+              <p className="storage-error" role="alert" title={storageErrorPath}>
+                <CircleAlert size={15} aria-hidden="true" />
+                ボット接続エラー：{storageErrors.join("・")}を読み取れません
+              </p>
+            ) : null}
             {data ? (
               <div className="symbol-selector">
                 <select
