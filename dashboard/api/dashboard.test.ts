@@ -8,6 +8,7 @@ import { sortActivitiesNewestFirst } from "../src/lib/format";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
@@ -67,6 +68,13 @@ describe("dashboard snapshot", () => {
       [item.reason, item.result].every((text) => /^[\x00-\x7F]*$/.test(text))
     )).toBe(true);
     expect(snapshot.equityHistory.length).toBeGreaterThan(24);
+
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60 * 60 * 1000);
+    const refreshed = await getDashboardSnapshot();
+    expect(refreshed.activities.map((item) => item.timestamp)).toEqual(
+      snapshot.activities.map((item) => item.timestamp),
+    );
+    dateNow.mockRestore();
   });
 
   it("公式一覧と状態を突合し、未作成の銘柄も待機中として選べる", async () => {
@@ -147,6 +155,39 @@ describe("dashboard snapshot", () => {
     const legacy = await getDashboardSnapshot("BTC_JPY");
     expect(legacy.market?.smaShort).toBe(105);
     expect(legacy.market?.smaLong).toBe(100);
+  });
+
+  it("実ログの発生時刻を再取得後もCSVの値のまま保持する", async () => {
+    mockOfficialSymbols();
+    const directory = await mkdtemp(path.join(tmpdir(), "gmo-dashboard-timestamps-"));
+    temporaryDirectories.push(directory);
+    const dataDirectory = path.join(directory, "data");
+    const logDirectory = path.join(directory, "logs");
+    process.env.BOT_DATA_DIR = dataDirectory;
+    process.env.BOT_LOG_DIR = logDirectory;
+    process.env.BOT_ENV_FILE = path.join(directory, ".env");
+    await import("node:fs/promises").then(({ mkdir }) => Promise.all([
+      mkdir(dataDirectory),
+      mkdir(logDirectory),
+    ]));
+    await writeFile(process.env.BOT_ENV_FILE, "DRY_RUN=true\nSYMBOLS=BTC_JPY\n");
+    await writeFile(path.join(dataDirectory, "state_BTC_JPY_dry-run.json"), JSON.stringify({
+      symbol: "BTC_JPY",
+      mode: "dry-run",
+      updated_at: new Date().toISOString(),
+    }));
+    await writeFile(
+      path.join(logDirectory, "decisions_20261103.csv"),
+      "timestamp_jst,event,symbol,reason,result\n" +
+      "2026-11-03T09:00:00+09:00,HOLD,BTC_JPY,first,kept\n" +
+      "2026-11-03T11:30:00+09:00,HOLD,BTC_JPY,second,kept\n",
+    );
+
+    const first = await getDashboardSnapshot("BTC_JPY");
+    const second = await getDashboardSnapshot("BTC_JPY");
+    const expected = ["2026-11-03T11:30:00+09:00", "2026-11-03T09:00:00+09:00"];
+    expect(first.activities.map((item) => item.timestamp)).toEqual(expected);
+    expect(second.activities.map((item) => item.timestamp)).toEqual(expected);
   });
 
   it("公式APIが失敗しても設定と状態の銘柄を一覧に残す", async () => {

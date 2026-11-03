@@ -14,6 +14,7 @@ const envFile = () => path.resolve(process.env.BOT_ENV_FILE || "../gmo-trading-b
 const MAX_LOG_BYTES = 4 * 1024 * 1024;
 const SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols";
 const SYMBOLS_TIMEOUT_MS = 5_000;
+const DEMO_REFERENCE_TIME = Date.now();
 
 type CsvRow = Record<string, string>;
 type BotState = Record<string, unknown> & {
@@ -246,7 +247,8 @@ function equitySeries(activities: ActivityItem[]): EquityPoint[] {
 
 
 function demoSnapshot(): DashboardSnapshot {
-  const now = Date.now();
+  // Keep demo event timestamps stable across polling and manual refreshes.
+  const now = DEMO_REFERENCE_TIME;
   const equityHistory: EquityPoint[] = Array.from({ length: 168 }, (_, index) => {
     const wave = Math.sin(index / 8) * 28000 + Math.sin(index / 19) * 13000;
     return {
@@ -282,7 +284,7 @@ function demoSnapshot(): DashboardSnapshot {
   });
   return {
     source: "demo",
-    generatedAt: new Date(now).toISOString(),
+    generatedAt: new Date().toISOString(),
     bot: {
       symbol: "BTC_JPY",
       availableSymbols: ["BTC_JPY"],
