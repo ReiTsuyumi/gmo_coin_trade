@@ -12,6 +12,8 @@ const dataDir = () => path.resolve(process.env.BOT_DATA_DIR || "../gmo-trading-b
 const logDir = () => path.resolve(process.env.BOT_LOG_DIR || "../gmo-trading-bot/logs");
 const envFile = () => path.resolve(process.env.BOT_ENV_FILE || "../gmo-trading-bot/.env");
 const MAX_LOG_BYTES = 4 * 1024 * 1024;
+const SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols";
+const SYMBOLS_TIMEOUT_MS = 5_000;
 
 type CsvRow = Record<string, string>;
 type BotState = Record<string, unknown> & {
@@ -196,6 +198,30 @@ async function readPublicSettings() {
   }
 }
 
+async function readOfficialSymbols(): Promise<string[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SYMBOLS_TIMEOUT_MS);
+  try {
+    const response = await fetch(SYMBOLS_URL, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    if (!response.ok) return [];
+    const payload = await response.json() as { status?: number; data?: { symbol?: unknown }[] };
+    if (payload.status !== 0 || !Array.isArray(payload.data)) return [];
+    return [...new Set(
+      payload.data
+        .map((item) => typeof item.symbol === "string" ? item.symbol.toUpperCase() : "")
+        .filter((symbol) => /^[A-Z0-9]+_JPY$/.test(symbol)),
+    )];
+  } catch {
+    // A public API outage must not hide existing bot states or local settings.
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function systemStatus(): Promise<DashboardSnapshot["system"]> {
   let cpuTemperature: number | null = null;
   try {
@@ -350,8 +376,13 @@ function waitingSnapshot(symbol: string, mode: string, settings: Awaited<ReturnT
 }
 
 export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSnapshot> {
-  const [states, settings] = await Promise.all([readStates(), readPublicSettings()]);
+  const [states, settings, officialSymbols] = await Promise.all([
+    readStates(),
+    readPublicSettings(),
+    readOfficialSymbols(),
+  ]);
   const availableSymbols = [...new Set([
+    ...officialSymbols,
     ...settings.configuredSymbols,
     ...states.map((item) => item.state.symbol),
   ])];
