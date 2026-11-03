@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""GMOコイン・レバレッジ取引ボット（BTC_JPY等、dry-run既定）。
+"""GMO Coin leverage trading bot for BTC_JPY and other symbols.
 
-- 買い・売りの両方向から新規建玉を持ち、成行注文は行わない。
-- 1時間ごとに確定済み15分足（切替で1分足）と板を評価する。
-- 複数銘柄を順次処理し、銘柄ごとに建玉1つ・指値注文1件だけを管理する。
-- 同じ銘柄の追加建玉は行わず、dry-runとliveで状態ファイルも分離する。
-- 設定とAPIキーは、このファイルと同じフォルダの.envから読み込む。
-- 本コードは参考実装であり、収益を保証しない。
+- Opens long and short positions without using market orders.
+- Evaluates closed 15-minute candles and the order book once per hour.
+- Processes multiple symbols sequentially with one position and one limit order per symbol.
+- Prevents additional positions in the same symbol and separates dry-run and live states.
+- Loads settings and API keys from .env beside this file.
+- This reference implementation does not guarantee profits.
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ def env_bool(name: str, default: bool) -> bool:
         return True
     if raw.strip().lower() in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(f"{name} は true/false で指定してください")
+    raise ValueError(f"{name} must be true or false")
 
 
 def env_int(name: str, default: int) -> int:
@@ -101,7 +101,7 @@ def ceil_step(value: Decimal, step: Decimal) -> Decimal:
 
 
 class GMOAPIError(RuntimeError):
-    """HTTP/APIから明確な失敗応答が返った場合の例外。"""
+    """Raised when the HTTP/API response explicitly reports failure."""
 
 
 @dataclass(frozen=True)
@@ -186,7 +186,7 @@ class Config:
             leverage=env_dec("LEVERAGE", "2"),
             price_improvement_ticks=env_int("PRICE_IMPROVEMENT_TICKS", 1),
             time_in_force=os.getenv("TIME_IN_FORCE", "FAS").upper(),
-            # 実運用前に口座の実手数料へ必ず合わせる。初期値は保守的な仮定値。
+            # Match these defaults to actual account fees before live trading; initial values are conservative.
             maker_fee_rate=env_dec("MAKER_FEE_RATE", "0.0005"),
             taker_fee_rate=env_dec("TAKER_FEE_RATE", "0.0005"),
             assumed_slippage_rate=env_dec("ASSUMED_SLIPPAGE_RATE", "0.0002"),
@@ -219,59 +219,59 @@ class Config:
 
     def validate(self) -> None:
         if not self.symbols or len(set(self.symbols)) != len(self.symbols):
-            raise ValueError("SYMBOLSは重複のないレバレッジ銘柄をカンマ区切りで指定してください")
+            raise ValueError("SYMBOLS must be a comma-separated list of unique leverage symbols")
         if any(not re.fullmatch(r"[A-Z0-9]+_JPY", symbol) for symbol in self.symbols):
-            raise ValueError("レバレッジAPI用のSYMBOLS（例: BTC_JPY,ETH_JPY）を指定してください")
+            raise ValueError("SYMBOLS must contain leverage API symbols such as BTC_JPY,ETH_JPY")
         if self.kline_interval not in {"1min", "5min", "10min", "15min", "30min", "1hour"}:
-            raise ValueError("KLINE_INTERVALは1min/5min/10min/15min/30min/1hourから選択してください")
+            raise ValueError("KLINE_INTERVAL must be one of 1min/5min/10min/15min/30min/1hour")
         if self.strategy not in {"EMA_RSI", "HA_SMA"}:
-            raise ValueError("STRATEGYはEMA_RSIまたはHA_SMAを指定してください")
+            raise ValueError("STRATEGY must be EMA_RSI or HA_SMA")
         if self.strategy == "EMA_RSI":
             if not (0 < self.ema_short < self.ema_long):
-                raise ValueError("EMA_SHORT < EMA_LONG である必要があります")
+                raise ValueError("EMA_SHORT must be less than EMA_LONG")
             if self.rsi_period < 2 or self.kline_count < self.ema_long + 2:
-                raise ValueError("KLINE_COUNTまたはRSI_PERIODが不足しています")
+                raise ValueError("KLINE_COUNT or RSI_PERIOD is insufficient")
             if not (D0 <= self.rsi_oversold < self.rsi_overbought <= D100):
-                raise ValueError("RSI閾値が不正です")
+                raise ValueError("Invalid RSI thresholds")
         else:
             if not (0 < self.sma_short < self.sma_long):
-                raise ValueError("SMA_SHORT < SMA_LONG である必要があります")
+                raise ValueError("SMA_SHORT must be less than SMA_LONG")
             if self.kline_count < self.sma_long + 2:
-                raise ValueError("KLINE_COUNTが不足しています")
+                raise ValueError("KLINE_COUNT is insufficient")
             if self.ha_bearish_exit_count < 1:
-                raise ValueError("HA_BEARISH_EXIT_COUNTは1以上にしてください")
+                raise ValueError("HA_BEARISH_EXIT_COUNT must be at least 1")
         rates = [
             self.max_spread_rate, self.assumed_slippage_rate,
             self.risk_per_trade_rate, self.daily_loss_limit_rate,
             self.max_position_rate, self.stop_distance_rate,
         ]
         if any(x <= 0 for x in rates):
-            raise ValueError("スプレッド・リスク・損失率は正の値にしてください")
+            raise ValueError("Spread, risk, and loss rates must be positive")
         if self.risk_per_trade_rate >= self.daily_loss_limit_rate:
-            raise ValueError("RISK_PER_TRADE_RATEはDAILY_LOSS_LIMIT_RATEより小さくしてください")
+            raise ValueError("RISK_PER_TRADE_RATE must be less than DAILY_LOSS_LIMIT_RATE")
         if self.max_position_rate > 1 or self.daily_loss_limit_rate >= 1:
-            raise ValueError("資産比率の設定が大きすぎます")
+            raise ValueError("Asset allocation settings are too large")
         if self.price_tick <= 0 or self.size_step <= 0 or self.min_order_size < self.size_step:
-            raise ValueError("価格・数量の刻み設定が不正です")
+            raise ValueError("Invalid price or size step settings")
         if not (D0 < self.target_order_notional <= self.max_order_notional):
-            raise ValueError("TARGET_ORDER_NOTIONAL_JPYは正の値でMAX以下にしてください")
+            raise ValueError("TARGET_ORDER_NOTIONAL_JPY must be positive and no greater than MAX_ORDER_NOTIONAL_JPY")
         if self.min_remaining_balance < D0 or self.leverage <= D0:
-            raise ValueError("MIN_REMAINING_BALANCE_JPYは0以上、LEVERAGEは正の値にしてください")
+            raise ValueError("MIN_REMAINING_BALANCE_JPY must be nonnegative and LEVERAGE must be positive")
         if self.absolute_loss_cutoff <= D0:
-            raise ValueError("ABSOLUTE_LOSS_CUTOFF_JPYは正の値にしてください")
+            raise ValueError("ABSOLUTE_LOSS_CUTOFF_JPY must be positive")
         if self.interval_seconds < 60 or self.cooldown_seconds < 0:
-            raise ValueError("ループ間隔は60秒以上、クールダウンは0秒以上にしてください")
+            raise ValueError("Loop interval must be at least 60 seconds and cooldown must be nonnegative")
         if self.time_in_force not in {"FAS", "FAK", "FOK", "SOK"}:
-            raise ValueError("TIME_IN_FORCEはFAS/FAK/FOK/SOKから選択してください")
+            raise ValueError("TIME_IN_FORCE must be FAS, FAK, FOK, or SOK")
         if self.time_in_force in {"FAK", "FOK"}:
-            raise ValueError("次サイクル取消方式のため、TIME_IN_FORCEはFASまたはSOKを推奨します")
+            raise ValueError("Use FAS or SOK for TIME_IN_FORCE with next-cycle cancellation")
         if self.taker_fee_rate < 0:
-            raise ValueError("TAKER_FEE_RATEに負値は設定できません")
+            raise ValueError("TAKER_FEE_RATE cannot be negative")
         if not self.dry_run:
             if not os.getenv("GMO_API_KEY") or not os.getenv("GMO_API_SECRET"):
-                raise ValueError("liveではGMO_API_KEYとGMO_API_SECRETが必要です")
+                raise ValueError("GMO_API_KEY and GMO_API_SECRET are required in live mode")
             if os.getenv("LIVE_TRADING_ACK") != "I_UNDERSTAND_REAL_ORDERS":
-                raise ValueError("liveにはLIVE_TRADING_ACK=I_UNDERSTAND_REAL_ORDERSが必要です")
+                raise ValueError("LIVE_TRADING_ACK=I_UNDERSTAND_REAL_ORDERS is required in live mode")
 
 
 class GMOClient:
@@ -305,7 +305,7 @@ class GMOClient:
         headers: dict[str, str] = {}
         if visibility == "private":
             timestamp = str(int(time.time() * 1000))
-            # 公式仕様: クエリではなく /v1/... のパスのみを署名する。GETのbodyは空。
+            # Official specification: sign only the /v1/... path, excluding queries; GET body is empty.
             sign = self.signature(self.secret, timestamp, method, path, body if method != "GET" else "")
             headers = {"API-KEY": self.api_key, "API-TIMESTAMP": timestamp, "API-SIGN": sign}
         if body:
@@ -329,8 +329,8 @@ class GMOClient:
                 if response.status_code != 200:
                     message = f"HTTP {response.status_code}: {response.text[:500]}"
                     if method != "GET" and response.status_code >= 500:
-                        # サーバーが受理済みか不明なので、呼び出し側でclientOrderId照会へ進める。
-                        raise RuntimeError(f"POST結果不明（自動再送禁止）: {message}")
+                        # Server acceptance is unknown, so the caller must reconcile by clientOrderId.
+                        raise RuntimeError(f"POST outcome unknown; automatic retry is forbidden: {message}")
                     raise GMOAPIError(message)
                 result = response.json()
                 if result.get("status") != 0:
@@ -343,7 +343,7 @@ class GMOClient:
                 if method != "GET" or attempt + 1 >= attempts:
                     break
                 time.sleep(0.5 * (2 ** attempt))
-        raise RuntimeError(f"API通信失敗（POSTは自動再送していません）: {last_error}")
+        raise RuntimeError(f"API communication failed; POST requests are not retried automatically: {last_error}")
 
     def status(self) -> str:
         return self._request("GET", "public", "/v1/status")["status"]
@@ -375,7 +375,7 @@ class GMOClient:
         for row in rows:
             if row.get("symbol") == self.cfg.symbol:
                 return row
-        raise ValueError(f"公開取引ルールに{self.cfg.symbol}がありません")
+        raise ValueError(f"No public trading rule found for {self.cfg.symbol}")
 
     def get_order(self, *, order_id: str = "", client_order_id: str = "") -> Optional[dict[str, Any]]:
         params = {"orderId": order_id} if order_id else {"clientOrderId": client_order_id}
@@ -433,12 +433,12 @@ class BotState:
     account_equity: Decimal = D0
     available_balance: Decimal = D0
     position_size: Decimal = D0
-    position_side: str = ""  # BUY=買い建玉、SELL=売り建玉
+    position_side: str = ""  # BUY=long position, SELL=short position
     position_id: str = ""
     position_entry_price: Decimal = D0
     position_entry_fee: Decimal = D0
     position_margin: Decimal = D0
-    position_cost: Decimal = D0  # 残建玉の約定代金＋新規手数料（リスク計算用）。
+    position_cost: Decimal = D0  # Remaining position notional plus opening fees for risk calculations.
     entry_risk_budget: Decimal = D0
     day_key: str = ""
     day_start_equity: Decimal = D0
@@ -461,7 +461,7 @@ class BotState:
             )
         raw = json.loads(path.read_text(encoding="utf-8"))
         if raw.get("symbol") != cfg.symbol or raw.get("mode") != cfg.mode:
-            raise ValueError(f"状態ファイルの対象が一致しません: {path}")
+            raise ValueError(f"State file symbol or mode mismatch: {path}")
         decimal_fields = {
             "cash", "account_equity", "available_balance",
             "position_size", "position_cost", "entry_risk_budget",
@@ -560,14 +560,14 @@ class Indicators:
     def trend_short(self) -> Decimal:
         value = self.sma_short if self.strategy == "HA_SMA" else self.ema_short
         if value is None:
-            raise ValueError("短期トレンド指標が未計算です")
+            raise ValueError("Short-term trend indicator has not been calculated")
         return value
 
     @property
     def trend_long(self) -> Decimal:
         value = self.sma_long if self.strategy == "HA_SMA" else self.ema_long
         if value is None:
-            raise ValueError("長期トレンド指標が未計算です")
+            raise ValueError("Long-term trend indicator has not been calculated")
         return value
 
 
@@ -589,11 +589,11 @@ def parse_book(raw: dict[str, Any]) -> Book:
     bids = raw.get("bids") or []
     asks = raw.get("asks") or []
     if not bids or not asks:
-        raise ValueError("板情報が空です")
+        raise ValueError("Order book is empty")
     best_bid = max(dec(row["price"]) for row in bids)
     best_ask = min(dec(row["price"]) for row in asks)
     if best_bid <= 0 or best_ask <= best_bid:
-        raise ValueError(f"板が不正です: bid={best_bid}, ask={best_ask}")
+        raise ValueError(f"Invalid order book: bid={best_bid}, ask={best_ask}")
     return Book(best_bid=best_bid, best_ask=best_ask)
 
 
@@ -668,8 +668,8 @@ def evaluate_indicators(closes: list[Decimal], cfg: Config) -> Indicators:
     long_series = ema_series(closes, cfg.ema_long)
     rsi = rsi_wilder(closes, cfg.rsi_period)
     if len(short_series) < 2 or len(long_series) < 2 or rsi is None:
-        raise ValueError("指標計算に必要な確定済みローソク足が不足しています")
-    # 長期EMAの系列終端に短期EMAを位置合わせする。
+        raise ValueError("Not enough closed candles to calculate indicators")
+    # Align the short EMA series with the end of the long EMA series.
     short_now = short_series[-1]
     short_prev = short_series[-2]
     long_now = long_series[-1]
@@ -679,9 +679,9 @@ def evaluate_indicators(closes: list[Decimal], cfg: Config) -> Indicators:
     buy = golden or (short_now > long_now and rsi <= cfg.rsi_oversold)
     sell = dead or rsi >= cfg.rsi_overbought
     reason = (
-        f"EMA短期={short_now:.2f}, EMA長期={long_now:.2f}, RSI={rsi:.2f}, "
-        f"GC={golden}, DC={dead}, RSI売られすぎ={rsi <= cfg.rsi_oversold}, "
-        f"RSI買われすぎ={rsi >= cfg.rsi_overbought}"
+        f"EMA_short={short_now:.2f}, EMA_long={long_now:.2f}, RSI={rsi:.2f}, "
+        f"GC={golden}, DC={dead}, RSI_oversold={rsi <= cfg.rsi_oversold}, "
+        f"RSI_overbought={rsi >= cfg.rsi_overbought}"
     )
     return Indicators(short_now, long_now, rsi, golden, dead, buy, sell, reason)
 
@@ -692,7 +692,7 @@ def evaluate_ha_sma(candles: list[dict[str, Decimal]], cfg: Config) -> Indicator
     long_series = sma_series(closes, cfg.sma_long)
     ha_candles = heikin_ashi(candles)
     if len(short_series) < 2 or len(long_series) < 2 or not ha_candles:
-        raise ValueError("平均足/SMAの計算に必要な確定済みローソク足が不足しています")
+        raise ValueError("Not enough closed candles to calculate Heikin-Ashi and SMA indicators")
     short_now = short_series[-1]
     short_prev = short_series[-2]
     long_now = long_series[-1]
@@ -710,10 +710,10 @@ def evaluate_ha_sma(candles: list[dict[str, Decimal]], cfg: Config) -> Indicator
     buy = golden and bullish
     sell = dead or early_exit
     reason = (
-        f"SMA短期={short_now:.2f}, SMA長期={long_now:.2f}, "
-        f"平均足open={latest_ha['open']:.2f}, 平均足close={latest_ha['close']:.2f}, "
-        f"GC={golden}, DC={dead}, 平均足陽線={bullish}, "
-        f"連続陰線={bearish_count}, 陰線早期撤退={early_exit}"
+        f"SMA_short={short_now:.2f}, SMA_long={long_now:.2f}, "
+        f"HA_open={latest_ha['open']:.2f}, HA_close={latest_ha['close']:.2f}, "
+        f"GC={golden}, DC={dead}, HA_bullish={bullish}, "
+        f"consecutive_bearish={bearish_count}, bearish_early_exit={early_exit}"
     )
     return Indicators(
         ema_short=None, ema_long=None, rsi=None,
@@ -731,7 +731,7 @@ def evaluate_strategy(candles: list[dict[str, Decimal]], cfg: Config) -> Indicat
 
 
 def gmo_kline_day(now: datetime) -> datetime.date:
-    # 1分足のdateは日本時間朝6時切り替え。
+    # The one-minute candle date changes at 06:00 JST.
     return (now.astimezone(JST) - timedelta(hours=6)).date()
 
 
@@ -787,25 +787,25 @@ def improved_limit_price(side: str, book: Book, cfg: Config, stop_loss: bool = F
     improvement = tick * cfg.price_improvement_ticks
     if side == "BUY":
         if stop_loss:
-            # 売り建玉の損切りは成行を使わず、best_askの指値で約定を優先する。
+            # For short stop-losses, use a best_ask limit instead of a market order.
             return ceil_step(book.best_ask, tick)
         raw = min(book.best_bid + improvement, book.best_ask - tick)
         price = floor_step(raw, tick)
         if not (book.best_bid <= price < book.best_ask):
-            raise ValueError("買い指値の計算結果が不正です")
+            raise ValueError("Invalid calculated buy limit price")
         return price
     if stop_loss:
-        # 成行は使わず、損切り時はbest_bidの指値で約定を優先する。
+        # For stop-losses, use a best_bid limit instead of a market order.
         return floor_step(book.best_bid, tick)
     raw = max(book.best_ask - improvement, book.best_bid + tick)
     price = ceil_step(raw, tick)
     if not (book.best_bid < price <= book.best_ask):
-        raise ValueError("売り指値の計算結果が不正です")
+        raise ValueError("Invalid calculated sell limit price")
     return price
 
 
 def round_trip_cost_rate(cfg: Config) -> Decimal:
-    # 指値でもtakerになる可能性を見て、往復ともtaker＋スリッページで保守的に評価。
+    # Limit orders may still be takers, so conservatively assume taker fees plus slippage both ways.
     return Decimal("2") * (cfg.taker_fee_rate + cfg.assumed_slippage_rate)
 
 
@@ -816,9 +816,9 @@ def fee_gate(indicators: Indicators, mid: Decimal, cfg: Config) -> tuple[bool, s
     expected_net = expected_gross - cost
     passed = expected_net >= cfg.min_net_profit_rate
     reason = (
-        f"期待 gross={expected_gross:.6%}, maker往復cost={maker_cost:.6%}, "
-        f"保守的taker往復cost={cost:.6%}, 期待 net={expected_net:.6%}, "
-        f"必要net={cfg.min_net_profit_rate:.6%}"
+        f"expected_gross={expected_gross:.6%}, maker_round_trip_cost={maker_cost:.6%}, "
+        f"conservative_taker_round_trip_cost={cost:.6%}, expected_net={expected_net:.6%}, "
+        f"required_net={cfg.min_net_profit_rate:.6%}"
     )
     return passed, reason
 
@@ -826,7 +826,7 @@ def fee_gate(indicators: Indicators, mid: Decimal, cfg: Config) -> tuple[bool, s
 def calculate_order_size(
     equity: Decimal, available_jpy: Decimal, mid: Decimal, cfg: Config
 ) -> tuple[Decimal, Decimal, str]:
-    """約500円を目標にし、最低単位が2,000円以上なら銘柄を見送る。"""
+    """Target about 500 JPY and skip symbols whose minimum order costs at least 2,000 JPY."""
     risk_budget = equity * cfg.risk_per_trade_rate
     risk_per_unit = mid * (cfg.stop_distance_rate + round_trip_cost_rate(cfg))
     by_risk = risk_budget / risk_per_unit
@@ -837,8 +837,8 @@ def calculate_order_size(
     minimum_notional = cfg.min_order_size * mid
     if minimum_notional >= cfg.max_order_notional:
         return D0, risk_budget, (
-            f"minimum_notional={minimum_notional:.2f}円 >= "
-            f"{cfg.max_order_notional}円のためこの銘柄は取引しません"
+            f"minimum_notional={minimum_notional:.2f} JPY >= "
+            f"{cfg.max_order_notional} JPY; skipping this symbol"
         )
     target_size = floor_step(cfg.target_order_notional / mid, cfg.size_step)
     size = max(cfg.min_order_size, target_size)
@@ -847,16 +847,16 @@ def calculate_order_size(
     required = notional / cfg.leverage + notional * cfg.taker_fee_rate
     remaining = available_jpy - required
     reason = (
-        f"target={cfg.target_order_notional}円, min_size={cfg.min_order_size}, "
-        f"size={size}, notional={notional:.2f}円, required_margin等={required:.2f}円, "
-        f"remaining={remaining:.2f}円, by_risk={by_risk}, by_allocation={by_allocation}"
+        f"target={cfg.target_order_notional} JPY, min_size={cfg.min_order_size}, "
+        f"size={size}, notional={notional:.2f} JPY, required_margin_and_fee={required:.2f} JPY, "
+        f"remaining={remaining:.2f} JPY, by_risk={by_risk}, by_allocation={by_allocation}"
     )
     if (
         size < cfg.min_order_size
         or notional > cfg.max_order_notional
         or remaining < cfg.min_remaining_balance
     ):
-        return D0, risk_budget, reason + ", 数量・2,000円上限・余力条件を満たしません"
+        return D0, risk_budget, reason + ", size, notional cap, or available balance constraints not met"
     return size, risk_budget, reason
 
 
@@ -874,7 +874,7 @@ class TradingBot:
         return (mid - self.state.position_entry_price) * self.state.position_size * direction
 
     def estimated_close_pnl(self, book: Book) -> Decimal:
-        """決済側気配と新規・決済手数料を含む現在の推定損益。"""
+        """Estimate current PnL using the closing-side quote and opening/closing fees."""
         if self.state.position_size <= 0:
             return D0
         direction = D1 if self.state.position_side == "BUY" else Decimal("-1")
@@ -884,7 +884,7 @@ class TradingBot:
         return gross - self.state.position_entry_fee - exit_fee
 
     def favorable_trend(self, indicators: Indicators) -> bool:
-        """買い建玉は上昇、売り建玉は下落トレンドなら利益を伸ばす。"""
+        """Let profits run for long positions in uptrends and short positions in downtrends."""
         if self.state.position_size <= 0:
             return False
         if self.state.position_side == "BUY":
@@ -892,7 +892,7 @@ class TradingBot:
         return indicators.trend_short < indicators.trend_long
 
     def account_snapshot(self, mid: Decimal) -> tuple[Decimal, Decimal, Decimal]:
-        """(時価評価総額, レバレッジ取引余力, 互換用の未使用値)を返す。"""
+        """Return account equity, available leverage balance, and an unused compatibility value."""
         if self.cfg.dry_run:
             equity = self.state.cash + self.unrealized_pnl(mid)
             available = max(D0, self.state.cash - self.state.position_margin)
@@ -901,9 +901,9 @@ class TradingBot:
             return equity, available, D0
         margin = self.client.margin()
         if margin.get("marginCallStatus") not in {None, "NORMAL"}:
-            raise RuntimeError(f"証拠金ステータス異常: {margin.get('marginCallStatus')}")
+            raise RuntimeError(f"Abnormal margin status: {margin.get('marginCallStatus')}")
         if margin.get("cryptoShortfallStatus") not in {None, "NORMAL"}:
-            raise RuntimeError(f"代用暗号資産ステータス異常: {margin.get('cryptoShortfallStatus')}")
+            raise RuntimeError(f"Abnormal crypto collateral status: {margin.get('cryptoShortfallStatus')}")
         equity = dec(margin["actualProfitLoss"])
         available = dec(margin["availableAmount"])
         self.state.account_equity = equity
@@ -917,7 +917,7 @@ class TradingBot:
             self.state.day_start_equity = equity
             self.state.daily_realized_pnl = D0
             self.state.daily_halted = False
-            LOGGER.info("日次リスク状態を初期化: %s, equity=%s", day, equity)
+            LOGGER.info("Resetting daily risk state: %s, equity=%s", day, equity)
         elif self.state.day_start_equity <= 0:
             self.state.day_start_equity = equity
 
@@ -928,7 +928,7 @@ class TradingBot:
         limit = self.state.day_start_equity * self.cfg.daily_loss_limit_rate
         if loss >= limit:
             if not self.state.daily_halted:
-                LOGGER.error("日次損失上限に到達: loss=%s, limit=%s", loss, limit)
+                LOGGER.error("Daily loss limit reached: loss=%s, limit=%s", loss, limit)
             self.state.daily_halted = True
         return self.state.daily_halted
 
@@ -953,7 +953,7 @@ class TradingBot:
         realized = D0
         if settle_type == "OPEN":
             if self.state.position_size > 0:
-                raise RuntimeError("同じ銘柄への追加建玉約定です。手動確認してください")
+                raise RuntimeError("Unexpected additional position fill for the same symbol; manual review required")
             self.state.position_side = side
             self.state.position_id = position_id or pending.get("position_id", "")
             self.state.position_size = size
@@ -967,9 +967,9 @@ class TradingBot:
         elif settle_type == "CLOSE":
             expected_side = "SELL" if self.state.position_side == "BUY" else "BUY"
             if self.state.position_size <= 0 or side != expected_side:
-                raise RuntimeError("建玉方向と決済約定が一致しません。手動確認してください")
+                raise RuntimeError("Close fill does not match the position side; manual review required")
             if size > self.state.position_size + self.cfg.size_step / 1000:
-                raise RuntimeError("ボット管理建玉を超える決済約定です。手動確認してください")
+                raise RuntimeError("Close fill exceeds the bot-managed position; manual review required")
             size = min(size, self.state.position_size)
             before = self.state.position_size
             ratio = size / before
@@ -978,12 +978,12 @@ class TradingBot:
             gross = (price - self.state.position_entry_price) * size * direction
             realized = gross - fee - entry_fee
             if loss_gain is not None and not self.cfg.dry_run:
-                # GMOのlossGainは決済手数料を含まないため、決済feeだけを控除する。
+                # GMO lossGain excludes closing fees, so subtract only the closing fee.
                 realized = loss_gain - fee
             self.state.daily_realized_pnl += realized
             self.state.total_realized_pnl += realized
             if self.cfg.dry_run:
-                # 新規feeはOPEN時に控除済みなので、ここではgrossと決済feeだけを反映する。
+                # Opening fees were deducted on OPEN, so apply only gross PnL and closing fees here.
                 self.state.cash += gross - fee
             self.state.position_size -= size
             self.state.position_cost -= self.state.position_cost * ratio
@@ -999,7 +999,7 @@ class TradingBot:
                 self.state.position_cost = D0
                 self.state.entry_risk_budget = D0
         else:
-            raise ValueError(f"不明なsettleType: {settle_type}")
+            raise ValueError(f"Unknown settleType: {settle_type}")
         self.state.last_fill_at = iso_now()
         if execution_id:
             self.state.processed_execution_ids.append(execution_id)
@@ -1016,7 +1016,7 @@ class TradingBot:
             spread=book.spread, spread_rate=book.spread_rate,
             **indicator_log_values(indicators),
         )
-        LOGGER.info("約定: %s %s size=%s price=%s fee=%s realized=%s", settle_type, side, size, price, fee, realized)
+        LOGGER.info("Fill: %s %s size=%s price=%s fee=%s realized=%s", settle_type, side, size, price, fee, realized)
         return realized
 
     def reconcile_dry_order(self, book: Book, indicators: Indicators) -> None:
@@ -1030,7 +1030,7 @@ class TradingBot:
             side == "SELL" and book.best_bid >= limit
         )
         if filled:
-            # 現在気配より悪いlimit価格を約定値にして、手数料もtakerで保守的に模擬。
+            # Conservatively simulate fills at the limit price and apply taker fees.
             fill_price = limit
             fee = fill_price * size * self.cfg.taker_fee_rate
             self.apply_fill(
@@ -1039,9 +1039,9 @@ class TradingBot:
                 settle_type=pending.get("settle_type", "OPEN"),
                 position_id=pending.get("position_id", ""),
             )
-            result = "dry-runで全量約定（保守的な簡易約定モデル）"
+            result = "dry-run filled in full (conservative simplified fill model)"
         else:
-            result = "未約定のためdry-runキャンセル"
+            result = "Unfilled; dry-run order canceled"
         self.audit.write(
             "ORDER_CLOSE", self.state, side=side, order_price=limit, order_size=size,
             order_id=pending["order_id"], reason=pending["reason"], result=result,
@@ -1065,12 +1065,12 @@ class TradingBot:
             pending["reconcile_attempts"] = attempts
             self.audit.write(
                 "ORDER_UNKNOWN", self.state, order_id=pending.get("order_id", ""),
-                reason="通信失敗後の照会", result=f"注文が見つかりません ({attempts}/3)",
+                reason="Reconciliation after a communication failure", result=f"Order not found ({attempts}/3)",
             )
             if attempts >= 3:
-                # clientOrderIdで3サイクル照会しても存在しない場合のみ、未受理と判断。
+                # Treat the order as rejected only after three clientOrderId lookups find nothing.
                 self.state.pending_order = None
-                LOGGER.warning("注文はAPI上に存在しないためpendingを解除: %s", pending["client_order_id"])
+                LOGGER.warning("Clearing pending order because it does not exist in the API: %s", pending["client_order_id"])
             self.state.save(self.cfg)
             return
 
@@ -1107,7 +1107,7 @@ class TradingBot:
         )
         if status in FINAL_ORDER_STATUSES:
             if executed_size > applied_size + self.cfg.size_step / 1000:
-                LOGGER.warning("約定照会が未反映のためpendingを保持: %s", order_id)
+                LOGGER.warning("Keeping pending order because executions have not been fully reconciled: %s", order_id)
             else:
                 self.state.pending_order = None
         elif status in ACTIVE_ORDER_STATUSES and not pending.get("cancel_requested"):
@@ -1115,7 +1115,7 @@ class TradingBot:
             pending["cancel_requested"] = True
             self.audit.write(
                 "CANCEL_REQUEST", self.state, order_id=order_id,
-                reason="次サイクルで未約定分を取消", result="accepted",
+                reason="Canceling the unfilled remainder on the next cycle", result="accepted",
             )
         self.state.save(self.cfg)
 
@@ -1142,20 +1142,20 @@ class TradingBot:
         position_id: str = "",
     ) -> None:
         if self.state.pending_order:
-            raise RuntimeError("pending注文があるため新規注文できません")
+            raise RuntimeError("Cannot submit a new order while another order is pending")
         if settle_type == "OPEN" and self.state.position_size > 0:
-            raise RuntimeError(f"{self.cfg.symbol}は建玉保有中のため追加建玉を禁止します")
+            raise RuntimeError(f"Additional positions are forbidden while {self.cfg.symbol} has an open position")
         if settle_type == "CLOSE" and (
             self.state.position_size < size or not position_id
         ):
-            raise RuntimeError("決済対象の建玉IDまたは数量が不正です")
+            raise RuntimeError("Invalid position ID or size for the close order")
         if settle_type == "OPEN":
             notional = price * size
             required = notional / self.cfg.leverage + notional * self.cfg.taker_fee_rate
             remaining = available_jpy - required
             if remaining < self.cfg.min_remaining_balance:
                 raise ValueError(
-                    f"注文後の取引余力が下限未満: required={required}, "
+                    f"Available balance after the order would be below the minimum: required={required}, "
                     f"remaining={remaining}, minimum={self.cfg.min_remaining_balance}"
                 )
         client_order_id = uuid.uuid4().hex
@@ -1174,7 +1174,7 @@ class TradingBot:
             "cancel_requested": False,
             "reconcile_attempts": 0,
         }
-        # liveは発注前にclientOrderIdを保存し、通信失敗後の自動再送を防ぐ。
+        # Save clientOrderId before live submission to prevent automatic resubmission after failures.
         self.state.pending_order = pending
         self.state.last_order_at = iso_now()
         self.state.save(self.cfg)
@@ -1196,7 +1196,7 @@ class TradingBot:
                 self.state.save(self.cfg)
             result = "accepted (simulated)" if self.cfg.dry_run else f"accepted orderId={pending['order_id']}"
         except GMOAPIError:
-            # 明確な拒否応答だけpendingを解除。タイムアウト等は照会対象として保持。
+            # Clear pending only after explicit rejection; retain timeouts and other unknown outcomes for reconciliation.
             self.state.pending_order = None
             self.state.save(self.cfg)
             raise
@@ -1207,7 +1207,7 @@ class TradingBot:
             spread=book.spread, spread_rate=book.spread_rate,
             equity_jpy=equity, **indicator_log_values(indicators),
         )
-        LOGGER.info("指値注文: %s %s price=%s size=%s %s", settle_type, side, price, size, result)
+        LOGGER.info("Limit order: %s %s price=%s size=%s %s", settle_type, side, price, size, result)
 
     def candles(self, now: datetime) -> list[dict[str, Decimal]]:
         day = gmo_kline_day(now)
@@ -1218,17 +1218,17 @@ class TradingBot:
             rows = self.client.klines((day - timedelta(days=offset)).strftime("%Y%m%d"))
             closed = extract_closed_candles(rows, [], now, self.cfg.kline_interval)
             all_candles.extend(closed)
-        # 各日付は重複しないため、確定済みの末尾K件を返す。
+        # Dates do not overlap, so return the last K closed candles.
         return all_candles[-self.cfg.kline_count:]
 
     def run_once(self) -> None:
         now = utc_now()
         exchange_status = self.client.status()
         if exchange_status != "OPEN":
-            self.audit.write("SKIP", self.state, reason="取引所がOPENではありません", result=exchange_status)
-            LOGGER.warning("取引所ステータス: %s", exchange_status)
+            self.audit.write("SKIP", self.state, reason="Exchange status is not OPEN", result=exchange_status)
+            LOGGER.warning("Exchange status: %s", exchange_status)
             return
-        # 最小数量・刻み・手数料は.envの固定値ではなく公開取引ルールを優先する。
+        # Prefer public trading rules over fixed .env values for minimum size, steps, and fees.
         rule = self.client.symbol_rule()
         self.cfg = replace(
             self.cfg,
@@ -1250,14 +1250,14 @@ class TradingBot:
         )
         self.audit.write("MARKET", self.state, reason=indicators.reason, result="evaluated", **common)
 
-        # 新規判断より先に、前サイクル注文の約定・取消を処理する。
+        # Reconcile fills and cancellations from the previous cycle before making new decisions.
         self.reconcile(book, indicators)
         if not self.cfg.dry_run:
             positions = self.client.open_positions()
             if positions and self.state.position_size <= 0:
                 self.audit.write(
-                    "SKIP", self.state, reason="ボット外を含む既存建玉があります",
-                    result=f"count={len(positions)}; 新規・追加注文を禁止", **common,
+                    "SKIP", self.state, reason="Existing positions include positions not managed by this bot",
+                    result=f"count={len(positions)}; New and additional orders are forbidden", **common,
                 )
                 return
             if positions and self.state.position_size > 0:
@@ -1267,16 +1267,16 @@ class TradingBot:
                 )
                 if managed is None or len(positions) != 1:
                     self.audit.write(
-                        "SKIP", self.state, reason="建玉IDが不一致、または複数建玉です",
-                        result="手動で建玉を確認するまで注文を停止", **common,
+                        "SKIP", self.state, reason="Position ID mismatch or multiple positions detected",
+                        result="Orders stopped until positions are reviewed manually", **common,
                     )
                     return
                 self.state.position_size = dec(managed["size"])
                 self.state.position_side = managed["side"]
                 self.state.position_entry_price = dec(managed["price"])
             if not positions and self.state.position_size > 0 and not self.state.pending_order:
-                LOGGER.warning("建玉が外部決済またはロスカットされています: %s", self.cfg.symbol)
-                self.audit.write("POSITION_SYNC", self.state, reason="API上の建玉なし", result="ローカル建玉を解除", **common)
+                LOGGER.warning("Position was closed externally or liquidated: %s", self.cfg.symbol)
+                self.audit.write("POSITION_SYNC", self.state, reason="No position found in the API", result="Clearing the local position", **common)
                 self.state.position_size = D0
                 self.state.position_side = ""
                 self.state.position_id = ""
@@ -1292,8 +1292,8 @@ class TradingBot:
             self.state.save(self.cfg)
             return
 
-        # -50円以下は他の全フィルターより先に決済する。成行は使わず、
-        # 買い建玉はbest_bidへ売り、売り建玉はbest_askで買い戻す。
+        # Close at -50 JPY or less before all other filters, without market orders.
+        # Sell long positions at best_bid and buy back short positions at best_ask.
         forced_loss = (
             self.state.position_size > 0
             and self.estimated_close_pnl(book) <= -self.cfg.absolute_loss_cutoff
@@ -1302,12 +1302,12 @@ class TradingBot:
             side = "SELL" if self.state.position_side == "BUY" else "BUY"
             size = floor_step(self.state.position_size, self.cfg.size_step)
             if size < self.cfg.min_order_size:
-                raise RuntimeError("強制決済数量が最小注文数量未満です。手動で直ちに確認してください")
+                raise RuntimeError("Forced close size is below the minimum order size; review immediately")
             estimated_net = self.estimated_close_pnl(book)
             price = improved_limit_price(side, book, self.cfg, stop_loss=True)
             reason = (
-                f"FORCED_LOSS_CUTOFF: 推定実質損益={estimated_net:.2f}円 <= "
-                f"-{self.cfg.absolute_loss_cutoff}円。スプレッド・クールダウン・日次停止を bypass"
+                f"FORCED_LOSS_CUTOFF: estimated_net_pnl={estimated_net:.2f} JPY <= "
+                f"-{self.cfg.absolute_loss_cutoff} JPY; bypassing spread, cooldown, and daily halt"
             )
             self.submit_order(
                 side=side, price=price, size=size, reason=reason, risk_budget=D0,
@@ -1320,13 +1320,13 @@ class TradingBot:
         if self.daily_loss_exceeded(equity):
             self.state.save(self.cfg)
             self.audit.write(
-                "DAILY_HALT", self.state, reason="日次損失上限に到達。-50円強制決済以外を停止",
+                "DAILY_HALT", self.state, reason="Daily loss limit reached; all actions except the absolute-loss forced close are stopped",
                 result=f"start={self.state.day_start_equity}, equity={equity}", **common,
             )
             return
         if book.spread_rate >= self.cfg.max_spread_rate:
             self.audit.write(
-                "SKIP", self.state, reason="スプレッド上限",
+                "SKIP", self.state, reason="Spread limit exceeded",
                 result=f"{book.spread_rate:.6%} >= {self.cfg.max_spread_rate:.6%}", **common,
             )
             return
@@ -1338,7 +1338,7 @@ class TradingBot:
             estimated_loss = max(D0, -estimated_net)
             budget = self.state.entry_risk_budget or equity * self.cfg.risk_per_trade_rate
             stop_loss = estimated_loss >= budget
-            stop_reason = f"推定実質損失={estimated_loss:.2f}円, 損失予算={budget:.2f}円"
+            stop_reason = f"estimated_net_loss={estimated_loss:.2f} JPY, loss_budget={budget:.2f} JPY"
 
         last_order = parse_time(self.state.last_order_at)
         cooling = (
@@ -1346,7 +1346,7 @@ class TradingBot:
             and (now - last_order).total_seconds() < self.cfg.cooldown_seconds
         )
         if cooling and not stop_loss:
-            self.audit.write("SKIP", self.state, reason="クールダウン中", result=self.state.last_order_at, **common)
+            self.audit.write("SKIP", self.state, reason="Cooldown active", result=self.state.last_order_at, **common)
             return
 
         if self.state.position_size > 0:
@@ -1355,8 +1355,8 @@ class TradingBot:
             exit_signal = indicators.sell_signal if self.state.position_side == "BUY" else indicators.buy_signal
             if profitable and favorable and not stop_loss:
                 self.audit.write(
-                    "HOLD", self.state, reason="含み益があり順方向トレンドのため利益を伸ばします",
-                    result=f"{self.state.position_side}建玉を維持; 推定実質損益={estimated_net:.2f}円", **common,
+                    "HOLD", self.state, reason="Holding a profitable position while the trend remains favorable",
+                    result=f"Keeping {self.state.position_side} position; estimated_net_pnl={estimated_net:.2f} JPY", **common,
                 )
                 return
             if stop_loss or exit_signal:
@@ -1364,7 +1364,7 @@ class TradingBot:
                 size = floor_step(self.state.position_size, self.cfg.size_step)
                 reason = ("STOP_LOSS: " if stop_loss else "EXIT: ") + stop_reason + indicators.reason
                 if size < self.cfg.min_order_size:
-                    self.audit.write("SKIP", self.state, reason=reason, result="決済数量が最小注文数量未満", **common)
+                    self.audit.write("SKIP", self.state, reason=reason, result="Close size is below the minimum order size", **common)
                     return
                 price = improved_limit_price(side, book, self.cfg, stop_loss=stop_loss)
                 self.submit_order(
@@ -1374,21 +1374,21 @@ class TradingBot:
                     settle_type="CLOSE", position_id=self.state.position_id or f"dry-{self.cfg.symbol}",
                 )
                 return
-            self.audit.write("HOLD", self.state, reason=indicators.reason, result=f"{self.state.position_side}建玉を維持", **common)
+            self.audit.write("HOLD", self.state, reason=indicators.reason, result=f"Keeping {self.state.position_side} position", **common)
             return
 
         entry_side = "BUY" if indicators.buy_signal else "SELL" if indicators.sell_signal else ""
         if entry_side:
             passed, fee_reason = fee_gate(indicators, book.mid, self.cfg)
             if not passed:
-                self.audit.write("SKIP", self.state, reason="実質利益フィルター", result=fee_reason, **common)
+                self.audit.write("SKIP", self.state, reason="Net profit filter", result=fee_reason, **common)
                 return
             size, risk_budget, size_reason = calculate_order_size(
                 equity, available_jpy, book.mid, self.cfg
             )
             if size <= 0:
                 self.audit.write(
-                    "SKIP", self.state, reason="最低単位・2,000円上限・注文後余力フィルター",
+                    "SKIP", self.state, reason="Minimum size, notional cap, and post-order balance filter",
                     result=size_reason, **common,
                 )
                 return
@@ -1401,7 +1401,7 @@ class TradingBot:
             )
             return
 
-        self.audit.write("HOLD", self.state, reason=indicators.reason, result="建玉なし", **common)
+        self.audit.write("HOLD", self.state, reason=indicators.reason, result="No open position", **common)
 
     def cancel_pending_on_exit(self) -> None:
         pending = self.state.pending_order
@@ -1411,9 +1411,9 @@ class TradingBot:
             self.client.cancel_order(pending["order_id"])
             pending["cancel_requested"] = True
             self.state.save(self.cfg)
-            LOGGER.info("終了時に未約定注文の取消を要求: %s", pending["order_id"])
+            LOGGER.info("Requested cancellation of the unfilled order on exit: %s", pending["order_id"])
         except Exception as exc:
-            LOGGER.error("終了時キャンセル失敗。注文を手動確認してください: %s", exc)
+            LOGGER.error("Cancellation on exit failed; review the order manually: %s", exc)
 
 
 def setup_logging(cfg: Config) -> None:
@@ -1432,7 +1432,7 @@ def setup_logging(cfg: Config) -> None:
 
 
 class SingleInstance:
-    """同一状態ファイルを使う二重起動を防ぐ（POSIX）。非POSIXでは作成だけ行う。"""
+    """Prevent duplicate processes using the same state file on POSIX; create only elsewhere."""
 
     def __init__(self, path: Path):
         self.path = path
@@ -1447,7 +1447,7 @@ class SingleInstance:
         except ImportError:
             pass
         except BlockingIOError as exc:
-            raise RuntimeError(f"同一設定のボットが既に起動しています: {self.path}") from exc
+            raise RuntimeError(f"A bot with the same configuration is already running: {self.path}") from exc
         self.handle.seek(0)
         self.handle.truncate()
         self.handle.write(str(os.getpid()))
@@ -1469,13 +1469,13 @@ def run_loop(cfg: Config, once: bool) -> None:
     stop_event = threading.Event()
 
     def request_stop(signum: int, _: Any) -> None:
-        LOGGER.info("停止シグナル: %s", signum)
+        LOGGER.info("Stop signal received: %s", signum)
         stop_event.set()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     LOGGER.info(
-        "起動: mode=%s symbols=%s interval=%ss states=%s",
+        "Started: mode=%s symbols=%s interval=%ss states=%s",
         cfg.mode, ",".join(cfg.symbols), cfg.interval_seconds,
         ",".join(str(bot.cfg.state_path) for bot in bots),
     )
@@ -1489,9 +1489,9 @@ def run_loop(cfg: Config, once: bool) -> None:
                     bot.run_once()
                 except Exception:
                     # One symbol failure must not block the other symbols.
-                    LOGGER.exception("%sのサイクルエラー。他銘柄の処理を継続します", bot.cfg.symbol)
+                    LOGGER.exception("Cycle error for %s; continuing with other symbols", bot.cfg.symbol)
                     bot.audit.write(
-                        "ERROR", bot.state, reason="サイクル例外", result="ログを確認"
+                        "ERROR", bot.state, reason="Cycle exception", result="See bot log for details"
                     )
             if once:
                 break
@@ -1502,25 +1502,25 @@ def run_loop(cfg: Config, once: bool) -> None:
             if not once and cfg.cancel_on_exit:
                 bot.cancel_pending_on_exit()
             bot.state.save(bot.cfg)
-        LOGGER.info("停止しました")
+        LOGGER.info("Stopped")
 
 
 def load_environment() -> None:
-    """スクリプト同階層の.envを必須読み込みし、OS環境変数より優先する。"""
+    """Require .env beside the script and override OS environment variables."""
     if not ENV_FILE.is_file():
         raise ValueError(
-            f".envが見つかりません: {ENV_FILE}。"
-            "環境設定例を.envという名前でスクリプトと同じフォルダに置いてください"
+            f".env not found: {ENV_FILE}. "
+            "Copy the environment example to .env in the script directory"
         )
     if not load_dotenv(dotenv_path=ENV_FILE, override=True):
-        raise ValueError(f".envを読み込めませんでした: {ENV_FILE}")
+        raise ValueError(f"Could not load .env: {ENV_FILE}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="GMOコイン・レバレッジ複数銘柄ボット（dry-run既定）")
-    parser.add_argument("--once", action="store_true", help="全銘柄を1回ずつ処理（検証用）")
-    parser.add_argument("--check-private", action="store_true", help="取引余力の取得だけ行い、注文せずに秘密鍵認証を確認")
-    parser.add_argument("--show-state", action="store_true", help="状態ファイルを表示して終了")
+    parser = argparse.ArgumentParser(description="GMO Coin multi-symbol leverage bot (dry-run by default)")
+    parser.add_argument("--once", action="store_true", help="Process every symbol once for verification")
+    parser.add_argument("--check-private", action="store_true", help="Fetch available balance and verify private API authentication without ordering")
+    parser.add_argument("--show-state", action="store_true", help="Print state files and exit")
     args = parser.parse_args()
     try:
         load_environment()
@@ -1529,12 +1529,12 @@ def main() -> int:
         setup_logging(cfg)
         if args.check_private:
             if not os.getenv("GMO_API_KEY") or not os.getenv("GMO_API_SECRET"):
-                raise ValueError("--check-privateにはGMO_API_KEYとGMO_API_SECRETが必要です")
+                raise ValueError("--check-private requires GMO_API_KEY and GMO_API_SECRET")
             margin = GMOClient(cfg).margin()
             print(
-                "Private API認証成功: "
+                "Private API authentication succeeded: "
                 f"actualProfitLoss={margin.get('actualProfitLoss')}, "
-                f"availableAmount={margin.get('availableAmount')}。注文は送信していません。"
+                f"availableAmount={margin.get('availableAmount')}. No orders were submitted."
             )
             return 0
         if args.show_state:
@@ -1550,7 +1550,7 @@ def main() -> int:
             run_loop(cfg, args.once)
         return 0
     except (ValueError, RuntimeError) as exc:
-        print(f"設定/起動エラー: {exc}", file=sys.stderr)
+        print(f"Configuration/startup error: {exc}", file=sys.stderr)
         return 2
 
 
