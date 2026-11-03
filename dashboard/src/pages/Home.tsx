@@ -33,6 +33,7 @@ const HEALTH: Record<BotHealth, { label: string; detail: string }> = {
   running: { label: "稼働中", detail: "状態ファイルは定期更新されています" },
   stale: { label: "更新停止", detail: "最終更新から時間が経過しています" },
   halted: { label: "取引停止", detail: "日次損失上限により停止しています" },
+  waiting: { label: "初回判定待ち", detail: "設定済みです。ボットの初回サイクル完了を待っています" },
 };
 
 function Metric({
@@ -280,12 +281,19 @@ export default function Home() {
           </div>
         ) : null}
 
+        {data?.source === "bot" && data.bot.health === "waiting" ? (
+          <div className="demo-banner" role="status">
+            <Clock3 size={18} aria-hidden="true" />
+            <p><strong>{data.bot.symbol}は初回判定待ちです</strong><span>ボットの.envには設定済みです。全銘柄の1サイクルが完了すると実データが表示されます。</span></p>
+          </div>
+        ) : null}
+
         {data ? (
           <div className={`connection-bar ${data.bot.health}`}>
             <span className="status-dot" aria-hidden="true" />
             <strong>{HEALTH[data.bot.health].label}</strong>
             <span>{HEALTH[data.bot.health].detail}</span>
-            <span className="last-update"><Clock3 size={14} aria-hidden="true" />{relativeTime(data.bot.updatedAt)}に更新</span>
+            <span className="last-update"><Clock3 size={14} aria-hidden="true" />{data.bot.updatedAt ? `${relativeTime(data.bot.updatedAt)}に更新` : "状態ファイルは未作成"}</span>
           </div>
         ) : null}
 
