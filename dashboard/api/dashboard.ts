@@ -8,9 +8,9 @@ import type {
   EquityPoint,
 } from "@contracts/dashboard";
 
-const dataDir = () => path.resolve(process.env.BOT_DATA_DIR || "../data");
-const logDir = () => path.resolve(process.env.BOT_LOG_DIR || "../logs");
-const envFile = () => path.resolve(process.env.BOT_ENV_FILE || "../.env");
+const dataDir = () => path.resolve(process.env.BOT_DATA_DIR || "../gmo-trading-bot/data");
+const logDir = () => path.resolve(process.env.BOT_LOG_DIR || "../gmo-trading-bot/logs");
+const envFile = () => path.resolve(process.env.BOT_ENV_FILE || "../gmo-trading-bot/.env");
 const MAX_LOG_BYTES = 4 * 1024 * 1024;
 
 type CsvRow = Record<string, string>;
