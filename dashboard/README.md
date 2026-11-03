@@ -4,7 +4,7 @@ Raspberry Pi上の取引ボットが出力する `data/state_*.json` と `logs/d
 
 ## 起動
 
-リポジトリのルートでボット用 `.env` を作成した後、次を実行します。
+`gmo-trading-bot/`でボット用 `.env` を作成した後、次を実行します。
 
 ```bash
 cd dashboard
