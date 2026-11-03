@@ -5,12 +5,12 @@ GMOコインの暗号資産レバレッジ取引向けPythonボットと、Raspb
 ## 構成
 
 ```text
-GMO-Coin-Trade/
+gmo_coin_trade/
 ├── gmo-trading-bot/
 │   ├── gmo_trading_bot.py
 │   ├── test_gmo_trading_bot.py
 │   ├── requirements.txt
-│   ├── .env.example
+│   ├── env.example
 │   └── セットアップと検証手順.md
 └── dashboard/
 ```
@@ -18,12 +18,12 @@ GMO-Coin-Trade/
 ## Raspberry Piでクローン
 
 ```bash
-git clone https://github.com/ReiTsuyumi/GMO-Coin-Trade.git
-cd GMO-Coin-Trade/gmo-trading-bot
+git clone https://github.com/ReiTsuyumi/gmo_coin_trade.git
+cd gmo_coin_trade/gmo-trading-bot
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-cp .env.example .env
+cp env.example .env
 ```
 
 最初は `.env` の `DRY_RUN=true` のまま検証してください。
@@ -44,8 +44,8 @@ python gmo_trading_bot.py
 別のターミナルで実行します。
 
 ```bash
-cd /home/pi/GMO-Coin-Trade/dashboard
-cp .env.example .env
+cd /home/pi/gmo_coin_trade/dashboard
+cp env.example .env
 npm install
 npm run build
 npm start

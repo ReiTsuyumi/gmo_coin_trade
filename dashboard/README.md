@@ -8,7 +8,7 @@ Raspberry Pi上の取引ボットが出力する `data/state_*.json` と `logs/d
 
 ```bash
 cd dashboard
-cp .env.example .env
+cp env.example .env
 npm install
 npm run build
 npm start
