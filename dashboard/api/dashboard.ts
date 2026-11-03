@@ -8,9 +8,9 @@ import type {
   EquityPoint,
 } from "@contracts/dashboard";
 
-const DATA_DIR = path.resolve(process.env.BOT_DATA_DIR || "../data");
-const LOG_DIR = path.resolve(process.env.BOT_LOG_DIR || "../logs");
-const ENV_FILE = path.resolve(process.env.BOT_ENV_FILE || "../.env");
+const dataDir = () => path.resolve(process.env.BOT_DATA_DIR || "../data");
+const logDir = () => path.resolve(process.env.BOT_LOG_DIR || "../logs");
+const envFile = () => path.resolve(process.env.BOT_ENV_FILE || "../.env");
 const MAX_LOG_BYTES = 4 * 1024 * 1024;
 
 type CsvRow = Record<string, string>;
@@ -112,10 +112,10 @@ async function listFiles(directory: string, pattern: RegExp) {
 }
 
 async function readStates(): Promise<{ state: BotState; filePath: string; mtime: number }[]> {
-  const names = await listFiles(DATA_DIR, /^state_[A-Za-z0-9_]+_(dry-run|live)\.json$/);
+  const names = await listFiles(dataDir(), /^state_[A-Za-z0-9_]+_(dry-run|live)\.json$/);
   const candidates = await Promise.all(
     names.map(async (name) => {
-      const filePath = path.join(DATA_DIR, name);
+      const filePath = path.join(dataDir(), name);
       try {
         const stat = await fs.stat(filePath);
         return { filePath, mtime: stat.mtimeMs };
@@ -142,11 +142,11 @@ async function readStates(): Promise<{ state: BotState; filePath: string; mtime:
 }
 
 async function readActivities(symbol?: string): Promise<ActivityItem[]> {
-  const names = (await listFiles(LOG_DIR, /^decisions_\d{8}\.csv$/)).sort().reverse().slice(0, 8);
+  const names = (await listFiles(logDir(), /^decisions_\d{8}\.csv$/)).sort().reverse().slice(0, 8);
   const batches = await Promise.all(
     names.map(async (name) => {
       try {
-        const rows = parseCsv(await readTail(path.join(LOG_DIR, name)));
+        const rows = parseCsv(await readTail(path.join(logDir(), name)));
         return rows.map((row, index): ActivityItem => ({
           id: `${name}-${row.symbol}-${row.timestamp_jst}-${index}`,
           symbol: row.symbol || "",
@@ -173,15 +173,23 @@ async function readActivities(symbol?: string): Promise<ActivityItem[]> {
 }
 
 async function readPublicSettings() {
-  const defaults = { maxSpreadRate: 0.001, riskPerTradeRate: 0.01, dailyLossLimitRate: 0.05, loopSeconds: 3600 };
+  const defaults = { maxSpreadRate: 0.001, riskPerTradeRate: 0.01, dailyLossLimitRate: 0.05, loopSeconds: 3600, configuredSymbols: [] as string[] };
   try {
-    // .env全体ではなく、画面に必要な非秘密の4項目だけを利用する。
-    const parsed = parseEnv(await fs.readFile(ENV_FILE));
+    // Read only non-secret dashboard settings; never return the parsed env itself.
+    const parsed = parseEnv(await fs.readFile(envFile()));
+    const rawSymbols = parsed.SYMBOLS || parsed.SYMBOL || "";
+    const configuredSymbols = [...new Set(
+      rawSymbols
+        .split(",")
+        .map((symbol) => symbol.trim().toUpperCase())
+        .filter((symbol) => /^[A-Z0-9]+_JPY$/.test(symbol)),
+    )];
     return {
       maxSpreadRate: numberValue(parsed.MAX_SPREAD_RATE, defaults.maxSpreadRate),
       riskPerTradeRate: numberValue(parsed.RISK_PER_TRADE_RATE, defaults.riskPerTradeRate),
       dailyLossLimitRate: numberValue(parsed.DAILY_LOSS_LIMIT_RATE, defaults.dailyLossLimitRate),
       loopSeconds: numberValue(parsed.LOOP_INTERVAL_SECONDS, defaults.loopSeconds),
+      configuredSymbols,
     };
   } catch {
     return defaults;
@@ -297,24 +305,78 @@ function demoSnapshot(): DashboardSnapshot {
   };
 }
 
+function waitingSnapshot(symbol: string, mode: string, settings: Awaited<ReturnType<typeof readPublicSettings>>): DashboardSnapshot {
+  return {
+    source: "bot",
+    generatedAt: new Date().toISOString(),
+    bot: {
+      symbol,
+      availableSymbols: settings.configuredSymbols,
+      mode,
+      health: "waiting",
+      updatedAt: "",
+      loopSeconds: settings.loopSeconds,
+      dailyHalted: false,
+    },
+    account: {
+      equity: 0,
+      cash: 0,
+      positionSize: 0,
+      positionSide: "",
+      positionId: "",
+      positionEntryPrice: 0,
+      positionMargin: 0,
+      availableBalance: 0,
+      positionCost: 0,
+      positionValue: 0,
+      unrealizedPnl: 0,
+      dailyRealizedPnl: 0,
+      totalRealizedPnl: 0,
+      dayStartEquity: 0,
+      dailyLoss: 0,
+      dailyLossLimit: 0,
+    },
+    market: null,
+    settings: {
+      maxSpreadRate: settings.maxSpreadRate,
+      riskPerTradeRate: settings.riskPerTradeRate,
+      dailyLossLimitRate: settings.dailyLossLimitRate,
+    },
+    pendingOrder: null,
+    equityHistory: [],
+    activities: [],
+    system: null,
+  };
+}
+
 export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSnapshot> {
-  const states = await readStates();
-  if (!states.length) return demoSnapshot();
-  const latest = states.find((item) => item.state.symbol === symbol) || states[0];
+  const [states, settings] = await Promise.all([readStates(), readPublicSettings()]);
+  const availableSymbols = [...new Set([
+    ...settings.configuredSymbols,
+    ...states.map((item) => item.state.symbol),
+  ])];
+  if (!states.length && !availableSymbols.length) return demoSnapshot();
+  const selected = availableSymbols.includes(symbol || "") ? symbol as string : availableSymbols[0];
+  const latest = states.find((item) => item.state.symbol === selected);
+
+  if (!latest) {
+    const snapshot = waitingSnapshot(selected, "dry-run", settings);
+    snapshot.bot.availableSymbols = availableSymbols;
+    return snapshot;
+  }
 
   const { state } = latest;
-  const [activities, settings, system] = await Promise.all([
+  const [activities, system] = await Promise.all([
     readActivities(state.symbol),
-    readPublicSettings(),
     systemStatus(),
   ]);
   const latestMarket = activities.find((row) => row.event === "MARKET" && row.symbol === state.symbol);
   const latestRows = await (async () => {
     // 市況の数値はAPI応答用に最新MARKET行だけを再取得せず、活動履歴とは別に保持する。
-    const names = (await listFiles(LOG_DIR, /^decisions_\d{8}\.csv$/)).sort().reverse().slice(0, 2);
+    const names = (await listFiles(logDir(), /^decisions_\d{8}\.csv$/)).sort().reverse().slice(0, 2);
     for (const name of names) {
       try {
-        const rows = parseCsv(await readTail(path.join(LOG_DIR, name)));
+        const rows = parseCsv(await readTail(path.join(logDir(), name)));
         const market = rows.reverse().find((row) => row.event === "MARKET" && row.symbol === state.symbol);
         if (market) return market;
       } catch {
@@ -351,7 +413,7 @@ export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSn
     generatedAt: new Date().toISOString(),
     bot: {
       symbol: state.symbol,
-      availableSymbols: [...new Set(states.map((item) => item.state.symbol))],
+      availableSymbols,
       mode: state.mode,
       health,
       updatedAt,
