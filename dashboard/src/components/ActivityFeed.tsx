@@ -8,7 +8,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { EVENT_LABELS, formatBtc, formatJpy, formatTime } from "@/lib/format";
+import { EVENT_LABELS, formatBtc, formatJpy, formatTime, sortActivitiesNewestFirst } from "@/lib/format";
 
 type Filter = "all" | "orders" | "decisions";
 const ORDER_EVENTS = new Set(["ORDER", "FILL", "ORDER_CLOSE", "ORDER_STATUS", "ORDER_UNKNOWN", "CANCEL_REQUEST"]);
@@ -37,7 +37,8 @@ export function ActivityFeed({
       : filter === "orders"
         ? items.filter((item) => ORDER_EVENTS.has(item.event))
         : items.filter((item) => !ORDER_EVENTS.has(item.event) && item.event !== "MARKET");
-    return compact ? rows.slice(0, 8) : rows.slice(0, 200);
+    const newestFirst = sortActivitiesNewestFirst(rows);
+    return newestFirst.slice(0, compact ? 8 : 200);
   }, [compact, filter, items]);
 
   return (

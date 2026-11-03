@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { getDashboardSnapshot, parseCsv } from "./dashboard";
+import { sortActivitiesNewestFirst } from "../src/lib/format";
 
 const temporaryDirectories: string[] = [];
 
@@ -25,6 +26,21 @@ describe("parseCsv", () => {
   it("引用符内の改行を1レコードとして保持する", () => {
     const rows = parseCsv('event,reason\nERROR,"line1\nline2"\n');
     expect(rows[0].reason).toBe("line1\nline2");
+  });
+});
+
+describe("activity ordering", () => {
+  it("画面のログを日時の新しい順に並べ、元の配列を変更しない", () => {
+    const rows = [
+      { id: "old", timestamp: "2026-11-03T09:00:00+09:00" },
+      { id: "new", timestamp: "2026-11-03T12:00:00+09:00" },
+      { id: "middle", timestamp: "2026-11-03T10:30:00+09:00" },
+    ];
+
+    const sorted = sortActivitiesNewestFirst(rows);
+
+    expect(sorted.map((item) => item.id)).toEqual(["new", "middle", "old"]);
+    expect(rows.map((item) => item.id)).toEqual(["old", "new", "middle"]);
   });
 });
 

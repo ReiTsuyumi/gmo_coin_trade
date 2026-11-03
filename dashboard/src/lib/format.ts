@@ -1,3 +1,15 @@
+import type { ActivityItem } from "@contracts/dashboard";
+
+export function sortActivitiesNewestFirst<T extends Pick<ActivityItem, "timestamp">>(items: T[]): T[] {
+  return [...items].sort((a, b) => {
+    const aTime = Date.parse(a.timestamp);
+    const bTime = Date.parse(b.timestamp);
+    if (!Number.isFinite(aTime)) return Number.isFinite(bTime) ? 1 : 0;
+    if (!Number.isFinite(bTime)) return -1;
+    return bTime - aTime;
+  });
+}
+
 export function formatJpy(value: number, maximumFractionDigits = 0) {
   return new Intl.NumberFormat("ja-JP", {
     style: "currency",
