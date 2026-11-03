@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { getDashboardSnapshot, parseCsv } from "./dashboard";
+import { cronStaleThresholdSeconds, getDashboardSnapshot, parseCsv } from "./dashboard";
 import { sortActivitiesNewestFirst } from "../src/lib/format";
 
 const temporaryDirectories: string[] = [];
@@ -10,6 +10,7 @@ const temporaryDirectories: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -42,6 +43,16 @@ describe("activity ordering", () => {
 
     expect(sorted.map((item) => item.id)).toEqual(["new", "middle", "old"]);
     expect(rows.map((item) => item.id)).toEqual(["old", "new", "middle"]);
+  });
+});
+
+describe("cron health threshold", () => {
+  it("cronの前後間隔を使い、短い周期でも最低15分の猶予を残す", () => {
+    const now = new Date("2026-11-03T12:30:00+09:00");
+    expect(cronStaleThresholdSeconds("0 * * * *", now)).toBe(5400);
+    expect(cronStaleThresholdSeconds("*/10 * * * *", now)).toBe(900);
+    expect(cronStaleThresholdSeconds("0 0 * * *", now)).toBe(129600);
+    expect(cronStaleThresholdSeconds("invalid", now)).toBe(5400);
   });
 });
 
@@ -210,6 +221,36 @@ describe("dashboard snapshot", () => {
     expect(snapshot.bot.availableSymbols).toEqual(["BTC_JPY", "ETH_JPY", "XRP_JPY"]);
     expect(snapshot.bot.symbol).toBe("BTC_JPY");
     expect(snapshot.bot.health).toBe("waiting");
+  });
+
+  it("TRADE_CRONの間隔で稼働中と更新停止を判定する", async () => {
+    mockOfficialSymbols();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-03T12:30:00+09:00"));
+    const directory = await mkdtemp(path.join(tmpdir(), "gmo-dashboard-cron-"));
+    temporaryDirectories.push(directory);
+    const dataDirectory = path.join(directory, "data");
+    const logDirectory = path.join(directory, "logs");
+    process.env.BOT_DATA_DIR = dataDirectory;
+    process.env.BOT_LOG_DIR = logDirectory;
+    process.env.BOT_ENV_FILE = path.join(directory, ".env");
+    await Promise.all([mkdir(dataDirectory), mkdir(logDirectory)]);
+    await writeFile(process.env.BOT_ENV_FILE, "DRY_RUN=true\nSYMBOLS=BTC_JPY\nTRADE_CRON=0 * * * *\n");
+    const statePath = path.join(dataDirectory, "state_BTC_JPY_dry-run.json");
+    await writeFile(statePath, JSON.stringify({
+      symbol: "BTC_JPY",
+      mode: "dry-run",
+      updated_at: "2026-11-03T10:30:00+09:00",
+    }));
+
+    const stale = await getDashboardSnapshot("BTC_JPY");
+    expect(stale.bot.tradeCron).toBe("0 * * * *");
+    expect(stale.bot.health).toBe("stale");
+
+    await writeFile(process.env.BOT_ENV_FILE, "DRY_RUN=true\nSYMBOLS=BTC_JPY\nTRADE_CRON=0 0 * * *\n");
+    const running = await getDashboardSnapshot("BTC_JPY");
+    expect(running.bot.tradeCron).toBe("0 0 * * *");
+    expect(running.bot.health).toBe("running");
   });
 
   it("dataとlogsが存在しない場合は両方の接続失敗を返す", async () => {

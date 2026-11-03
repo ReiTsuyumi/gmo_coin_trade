@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseEnv } from "dotenv";
+import { CronExpressionParser } from "cron-parser";
 import type {
   ActivityItem,
   BotStorage,
@@ -17,6 +18,9 @@ const MAX_LOG_BYTES = 4 * 1024 * 1024;
 const SYMBOLS_URL = "https://api.coin.z.com/public/v1/symbols";
 const SYMBOLS_TIMEOUT_MS = 5_000;
 const DEMO_REFERENCE_TIME = Date.now();
+const DEFAULT_TRADE_CRON = "0 * * * *";
+const CRON_TIME_ZONE = "Asia/Tokyo";
+const MIN_STALE_GRACE_SECONDS = 900;
 
 type CsvRow = Record<string, string>;
 type BotState = Record<string, unknown> & {
@@ -195,8 +199,28 @@ async function readActivities(symbol?: string): Promise<ActivityItem[]> {
     .slice(0, 500);
 }
 
+export function cronStaleThresholdSeconds(expression: string, now = new Date()): number {
+  try {
+    // Adjacent JST cron occurrences provide a schedule-aware stale grace period.
+    const reference = new Date(now.getTime() + 1);
+    const previous = CronExpressionParser.parse(expression, {
+      currentDate: reference,
+      tz: CRON_TIME_ZONE,
+    }).prev().toDate();
+    const next = CronExpressionParser.parse(expression, {
+      currentDate: reference,
+      tz: CRON_TIME_ZONE,
+    }).next().toDate();
+    const intervalSeconds = (next.getTime() - previous.getTime()) / 1000;
+    if (intervalSeconds <= 0) throw new Error("Invalid cron interval");
+    return Math.max(MIN_STALE_GRACE_SECONDS, intervalSeconds * 1.5);
+  } catch {
+    return Math.max(MIN_STALE_GRACE_SECONDS, 3600 * 1.5);
+  }
+}
+
 async function readPublicSettings() {
-  const defaults = { maxSpreadRate: 0.001, riskPerTradeRate: 0.01, dailyLossLimitRate: 0.05, loopSeconds: 3600, configuredSymbols: [] as string[] };
+  const defaults = { maxSpreadRate: 0.001, riskPerTradeRate: 0.01, dailyLossLimitRate: 0.05, tradeCron: DEFAULT_TRADE_CRON, configuredSymbols: [] as string[] };
   try {
     // Read only non-secret dashboard settings; never return the parsed env itself.
     const parsed = parseEnv(await fs.readFile(envFile()));
@@ -211,7 +235,7 @@ async function readPublicSettings() {
       maxSpreadRate: numberValue(parsed.MAX_SPREAD_RATE, defaults.maxSpreadRate),
       riskPerTradeRate: numberValue(parsed.RISK_PER_TRADE_RATE, defaults.riskPerTradeRate),
       dailyLossLimitRate: numberValue(parsed.DAILY_LOSS_LIMIT_RATE, defaults.dailyLossLimitRate),
-      loopSeconds: numberValue(parsed.LOOP_INTERVAL_SECONDS, defaults.loopSeconds),
+      tradeCron: parsed.TRADE_CRON?.trim() || defaults.tradeCron,
       configuredSymbols,
     };
   } catch {
@@ -312,7 +336,7 @@ function demoSnapshot(botStorage: BotStorage): DashboardSnapshot {
       mode: "dry-run",
       health: "running",
       updatedAt: new Date(now - 90_000).toISOString(),
-      loopSeconds: 3600,
+      tradeCron: DEFAULT_TRADE_CRON,
       dailyHalted: false,
     },
     account: {
@@ -370,7 +394,7 @@ function waitingSnapshot(
       mode,
       health: "waiting",
       updatedAt: "",
-      loopSeconds: settings.loopSeconds,
+      tradeCron: settings.tradeCron,
       dailyHalted: false,
     },
     account: {
@@ -464,7 +488,11 @@ export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSn
   const updatedAt = stringValue(state.updated_at, latestMarket?.timestamp || new Date().toISOString());
   const ageSeconds = Math.max(0, (Date.now() - new Date(updatedAt).getTime()) / 1000);
   const dailyHalted = Boolean(state.daily_halted);
-  const health = dailyHalted ? "halted" : ageSeconds <= Math.max(900, settings.loopSeconds * 1.5) ? "running" : "stale";
+  const health = dailyHalted
+    ? "halted"
+    : ageSeconds <= cronStaleThresholdSeconds(settings.tradeCron)
+      ? "running"
+      : "stale";
   const pending = state.pending_order && typeof state.pending_order === "object"
     ? state.pending_order as Record<string, unknown>
     : null;
@@ -479,7 +507,7 @@ export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSn
       mode: state.mode,
       health,
       updatedAt,
-      loopSeconds: settings.loopSeconds,
+      tradeCron: settings.tradeCron,
       dailyHalted,
     },
     account: {
