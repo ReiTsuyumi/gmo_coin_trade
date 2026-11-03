@@ -47,6 +47,9 @@ describe("dashboard snapshot", () => {
     const snapshot = await getDashboardSnapshot();
     expect(snapshot.source).toBe("demo");
     expect(snapshot.activities.length).toBeGreaterThan(0);
+    expect(snapshot.activities.every((item) =>
+      [item.reason, item.result].every((text) => /^[\x00-\x7F]*$/.test(text))
+    )).toBe(true);
     expect(snapshot.equityHistory.length).toBeGreaterThan(24);
   });
 
@@ -91,6 +94,43 @@ describe("dashboard snapshot", () => {
     expect(snapshot.bot.symbol).toBe("ETH_JPY");
     expect(snapshot.bot.health).toBe("waiting");
     expect(snapshot.account.equity).toBe(0);
+  });
+
+  it("reads both English and legacy Japanese SMA fields", async () => {
+    mockOfficialSymbols();
+    const directory = await mkdtemp(path.join(tmpdir(), "gmo-dashboard-sma-"));
+    temporaryDirectories.push(directory);
+    const dataDirectory = path.join(directory, "data");
+    const logDirectory = path.join(directory, "logs");
+    process.env.BOT_DATA_DIR = dataDirectory;
+    process.env.BOT_LOG_DIR = logDirectory;
+    process.env.BOT_ENV_FILE = path.join(directory, ".env");
+    await import("node:fs/promises").then(({ mkdir }) => Promise.all([
+      mkdir(dataDirectory),
+      mkdir(logDirectory),
+    ]));
+    await writeFile(process.env.BOT_ENV_FILE, "DRY_RUN=true\nSYMBOLS=BTC_JPY\n");
+    await writeFile(path.join(dataDirectory, "state_BTC_JPY_dry-run.json"), JSON.stringify({
+      symbol: "BTC_JPY",
+      mode: "dry-run",
+      updated_at: new Date().toISOString(),
+    }));
+    const logPath = path.join(logDirectory, "decisions_20261103.csv");
+    const header = "timestamp_jst,event,symbol,reason,result,equity_jpy,mid_price,best_bid,best_ask,spread,spread_rate\n";
+    const writeMarket = (reason: string) => writeFile(
+      logPath,
+      `${header}2026-11-03T10:00:00+09:00,MARKET,BTC_JPY,"${reason}",evaluated,100000,105,104,106,2,0.019047\n`,
+    );
+
+    await writeMarket("SMA_short=105.00, SMA_long=100.00");
+    const english = await getDashboardSnapshot("BTC_JPY");
+    expect(english.market?.smaShort).toBe(105);
+    expect(english.market?.smaLong).toBe(100);
+
+    await writeMarket("SMA短期=105.00, SMA長期=100.00");
+    const legacy = await getDashboardSnapshot("BTC_JPY");
+    expect(legacy.market?.smaShort).toBe(105);
+    expect(legacy.market?.smaLong).toBe(100);
   });
 
   it("公式APIが失敗しても設定と状態の銘柄を一覧に残す", async () => {
