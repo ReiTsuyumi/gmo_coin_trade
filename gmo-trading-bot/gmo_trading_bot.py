@@ -2,7 +2,7 @@
 """GMO Coin leverage trading bot for BTC_JPY and other symbols.
 
 - Opens long and short positions without using market orders.
-- Evaluates closed 15-minute candles and the order book once per hour.
+- Evaluates closed 15-minute candles and the order book at configured JST cron times.
 - Processes multiple symbols sequentially with one position and one limit order per symbol.
 - Prevents additional positions in the same symbol and separates dry-run and live states.
 - Loads settings and API keys from .env beside this file.
@@ -33,6 +33,7 @@ from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import requests
+from croniter import croniter
 from dotenv import load_dotenv
 
 
@@ -73,6 +74,15 @@ def parse_time(value: Optional[str]) -> Optional[datetime]:
     return result if result.tzinfo else result.replace(tzinfo=UTC)
 
 
+def next_cron_time(expression: str, after: Optional[datetime] = None) -> datetime:
+    """Return the first matching JST time strictly after the supplied instant."""
+    current = after or utc_now()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=JST)
+    local = current.astimezone(JST)
+    return croniter(expression, local).get_next(datetime).astimezone(JST)
+
+
 def env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -109,7 +119,7 @@ class Config:
     dry_run: bool
     symbol: str
     symbols: tuple[str, ...]
-    interval_seconds: int
+    trade_cron: str
     kline_count: int
     kline_interval: str
     strategy: str
@@ -162,7 +172,7 @@ class Config:
             dry_run=dry_run,
             symbol=symbol,
             symbols=symbols,
-            interval_seconds=env_int("LOOP_INTERVAL_SECONDS", 3600),
+            trade_cron=os.getenv("TRADE_CRON", "0 * * * *").strip(),
             kline_count=env_int("KLINE_COUNT", 100),
             kline_interval=os.getenv("KLINE_INTERVAL", "15min").strip(),
             strategy=os.getenv("STRATEGY", "EMA_RSI").strip().upper(),
@@ -259,8 +269,10 @@ class Config:
             raise ValueError("MIN_REMAINING_BALANCE_JPY must be nonnegative and LEVERAGE must be positive")
         if self.absolute_loss_cutoff <= D0:
             raise ValueError("ABSOLUTE_LOSS_CUTOFF_JPY must be positive")
-        if self.interval_seconds < 60 or self.cooldown_seconds < 0:
-            raise ValueError("Loop interval must be at least 60 seconds and cooldown must be nonnegative")
+        if len(self.trade_cron.split()) != 5 or not croniter.is_valid(self.trade_cron):
+            raise ValueError("TRADE_CRON must be a valid five-field cron expression")
+        if self.cooldown_seconds < 0:
+            raise ValueError("COOLDOWN_SECONDS must be nonnegative")
         if self.time_in_force not in {"FAS", "FAK", "FOK", "SOK"}:
             raise ValueError("TIME_IN_FORCE must be FAS, FAK, FOK, or SOK")
         if self.time_in_force in {"FAK", "FOK"}:
@@ -1472,31 +1484,39 @@ def run_loop(cfg: Config, once: bool) -> None:
         LOGGER.info("Stop signal received: %s", signum)
         stop_event.set()
 
+    def process_symbols() -> None:
+        for bot in bots:
+            if stop_event.is_set():
+                break
+            try:
+                bot.run_once()
+            except Exception:
+                # One symbol failure must not block the other symbols.
+                LOGGER.exception("Cycle error for %s; continuing with other symbols", bot.cfg.symbol)
+                bot.audit.write(
+                    "ERROR", bot.state, reason="Cycle exception", result="See bot log for details"
+                )
+
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     LOGGER.info(
-        "Started: mode=%s symbols=%s interval=%ss states=%s",
-        cfg.mode, ",".join(cfg.symbols), cfg.interval_seconds,
+        "Started: mode=%s symbols=%s cron=%s timezone=Asia/Tokyo states=%s",
+        cfg.mode, ",".join(cfg.symbols), cfg.trade_cron,
         ",".join(str(bot.cfg.state_path) for bot in bots),
     )
     try:
+        if once:
+            process_symbols()
+            return
+        next_run = next_cron_time(cfg.trade_cron)
         while not stop_event.is_set():
-            started = time.monotonic()
-            for bot in bots:
-                if stop_event.is_set():
-                    break
-                try:
-                    bot.run_once()
-                except Exception:
-                    # One symbol failure must not block the other symbols.
-                    LOGGER.exception("Cycle error for %s; continuing with other symbols", bot.cfg.symbol)
-                    bot.audit.write(
-                        "ERROR", bot.state, reason="Cycle exception", result="See bot log for details"
-                    )
-            if once:
+            wait_seconds = max(0.0, (next_run - utc_now()).total_seconds())
+            LOGGER.info("Next evaluation: %s", next_run.isoformat(timespec="seconds"))
+            if stop_event.wait(wait_seconds):
                 break
-            elapsed = time.monotonic() - started
-            stop_event.wait(max(1.0, cfg.interval_seconds - elapsed))
+            process_symbols()
+            # Skip missed schedules instead of replaying them after a long cycle or sleep.
+            next_run = next_cron_time(cfg.trade_cron)
     finally:
         for bot in bots:
             if not once and cfg.cancel_on_exit:
