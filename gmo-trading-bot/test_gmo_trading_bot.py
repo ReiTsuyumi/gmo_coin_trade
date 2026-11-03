@@ -14,8 +14,8 @@ from gmo_trading_bot import (
     GMOAPIError, GMOClient, TradingBot, Book, BotState, Indicators,
     calculate_order_size, evaluate_ha_sma, evaluate_strategy,
     extract_closed_candles, extract_closed_closes, fee_gate, heikin_ashi,
-    improved_limit_price, load_environment, parse_book, rsi_wilder, run_loop,
-    sma_series,
+    improved_limit_price, load_environment, next_cron_time, parse_book, rsi_wilder, run_loop,
+    sma_series, JST,
 )
 
 
@@ -65,6 +65,7 @@ class BotTestCase(unittest.TestCase):
             "DATA_DIR": str(Path(self.temp.name) / "data"),
             "LOG_DIR": str(Path(self.temp.name) / "logs"),
             "COOLDOWN_SECONDS": "0",
+            "TRADE_CRON": "0 * * * *",
             "GMO_API_KEY": "test-key",
             "GMO_API_SECRET": "test-secret",
         }
@@ -93,8 +94,8 @@ class BotTestCase(unittest.TestCase):
                 load_environment()
             self.assertEqual(os.getenv("SYMBOL"), "ETH_JPY")
 
-    def test_hourly_interval_and_multiple_symbols(self):
-        self.assertEqual(self.cfg.interval_seconds, 3600)
+    def test_hourly_cron_and_multiple_symbols(self):
+        self.assertEqual(self.cfg.trade_cron, "0 * * * *")
         self.assertEqual(self.cfg.kline_interval, "15min")
         with patch.dict(os.environ, {"SYMBOLS": "BTC_JPY,ETH_JPY,SOL_JPY", "SYMBOL": "BTC_JPY"}):
             from gmo_trading_bot import Config
@@ -108,6 +109,27 @@ class BotTestCase(unittest.TestCase):
             duplicate = Config.from_env()
         with self.assertRaisesRegex(ValueError, "unique"):
             duplicate.validate()
+
+    def test_invalid_cron_expression_is_rejected(self):
+        for expression in ("not a cron", "0 * * * * *", "61 * * * *"):
+            with self.subTest(expression=expression):
+                with patch.dict(os.environ, {"TRADE_CRON": expression}):
+                    from gmo_trading_bot import Config
+                    cfg = Config.from_env()
+                with self.assertRaisesRegex(ValueError, "TRADE_CRON"):
+                    cfg.validate()
+
+    def test_next_cron_time_is_jst_and_strictly_after_current_time(self):
+        current = datetime(2026, 11, 3, 12, 30, tzinfo=JST)
+        self.assertEqual(
+            next_cron_time("0 * * * *", current),
+            datetime(2026, 11, 3, 13, 0, tzinfo=JST),
+        )
+        scheduled_minute = datetime(2026, 11, 3, 12, 0, tzinfo=JST)
+        self.assertEqual(
+            next_cron_time("*/15 * * * *", scheduled_minute),
+            datetime(2026, 11, 3, 12, 15, tzinfo=JST),
+        )
 
     def test_signature_is_hmac_of_exact_compact_body(self):
         client = GMOClient(self.cfg)
@@ -494,6 +516,26 @@ class BotTestCase(unittest.TestCase):
             bot.run_once.assert_called_once_with()
             bot.cancel_pending_on_exit.assert_not_called()
             bot.state.save.assert_called_once_with(bot.cfg)
+
+    def test_continuous_mode_waits_for_cron_and_stops_without_catch_up(self):
+        bot = Mock()
+        bot.cfg = self.cfg
+        stop_event = Mock()
+        stop_event.is_set.return_value = False
+        stop_event.wait.side_effect = [False, True]
+        current = datetime(2026, 11, 3, 12, 30, tzinfo=JST)
+        next_run = datetime(2026, 11, 3, 13, 0, tzinfo=JST)
+        following_run = datetime(2026, 11, 3, 14, 0, tzinfo=JST)
+        with (
+            patch("gmo_trading_bot.TradingBot", return_value=bot),
+            patch("gmo_trading_bot.threading.Event", return_value=stop_event),
+            patch("gmo_trading_bot.utc_now", return_value=current),
+            patch("gmo_trading_bot.next_cron_time", side_effect=[next_run, following_run]) as schedule,
+        ):
+            run_loop(self.cfg, once=False)
+        bot.run_once.assert_called_once_with()
+        stop_event.wait.assert_any_call(1800.0)
+        self.assertEqual(schedule.call_count, 2)
 
     def test_state_round_trip(self):
         state = BotState(symbol=self.cfg.symbol, mode="dry-run", cash=Decimal("123.45"))
