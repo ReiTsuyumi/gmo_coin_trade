@@ -117,6 +117,8 @@
 .symbol-selector select { min-height: 44px; padding: 4px 28px 4px 9px; border: 1px solid oklch(var(--border)); border-radius: 5px; background: oklch(var(--panel)); color: oklch(var(--foreground)); font: inherit; font-weight: 650; }
 .mode-badge { padding: 2px 7px; border: 1px solid oklch(var(--primary) / 0.35); border-radius: 4px; color: oklch(var(--primary)); font-family: ui-monospace, monospace; font-size: 10px; letter-spacing: 0.08em; }
 .mode-badge.live { color: oklch(var(--negative)); border-color: oklch(var(--negative) / 0.5); }
+.topbar p.storage-error { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: oklch(var(--negative)); font-size: 13px; font-weight: 650; }
+.storage-error svg { flex-shrink: 0; }
 .header-actions { display: flex; gap: 8px; flex-shrink: 0; }
 .icon-text-button, .refresh-button, .primary-button {
   min-height: 44px;
