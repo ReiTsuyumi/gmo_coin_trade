@@ -37,7 +37,7 @@ function nullableNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-/** RFC4180対応。引用符内のカンマ・改行・二重引用符を処理する。 */
+/** Parse RFC4180 CSV, including commas, newlines, and escaped quotes inside quoted fields. */
 export function parseCsv(text: string): CsvRow[] {
   const source = text.replace(/^\uFEFF/, "");
   const records: string[][] = [];
@@ -93,7 +93,7 @@ async function readTail(filePath: string): Promise<string> {
     if (stat.size > length) {
       const firstNewline = text.indexOf("\n");
       text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
-      // 末尾から読んだ場合はヘッダーを補うため、先頭だけ別途取得する。
+      // When reading from the tail, fetch the header separately from the beginning.
       const head = Buffer.alloc(Math.min(4096, stat.size));
       await handle.read(head, 0, head.length, 0);
       const header = head.toString("utf8").split(/\r?\n/, 1)[0];
@@ -228,7 +228,7 @@ async function systemStatus(): Promise<DashboardSnapshot["system"]> {
     const thermal = await fs.readFile("/sys/class/thermal/thermal_zone0/temp", "utf8");
     cpuTemperature = numberValue(thermal.trim()) / 1000;
   } catch {
-    // Raspberry Pi以外や権限がない環境では温度を表示しない。
+    // Hide temperature on non-Raspberry Pi systems or when permissions prevent reading it.
   }
   return {
     memoryUsedPercent: ((os.totalmem() - os.freemem()) / os.totalmem()) * 100,
@@ -255,13 +255,13 @@ function demoSnapshot(): DashboardSnapshot {
     };
   });
   const templates = [
-    ["HOLD", "EMA短期=12,649,154.55, EMA長期=12,656,701.11, RSI=25.75", "position=0"],
-    ["MARKET", "1分足・板・指標を更新", "evaluated"],
-    ["SKIP", "スプレッド上限", "0.1042% >= 0.1000%"],
-    ["ORDER", "ENTRY: EMAゴールデンクロス; 往復コスト考慮", "accepted (simulated)"],
-    ["FILL", "ENTRY: EMAゴールデンクロス", "fee=632.17, realized=0"],
-    ["ORDER_STATUS", "次サイクルの注文状態を確認", "status=EXECUTED"],
-    ["MARKET", "1分足・板・指標を更新", "evaluated"],
+    ["HOLD", "EMA_short=12,649,154.55, EMA_long=12,656,701.11, RSI=25.75", "position=0"],
+    ["MARKET", "Updated one-minute candles, order book, and indicators", "evaluated"],
+    ["SKIP", "Spread limit exceeded", "0.1042% >= 0.1000%"],
+    ["ORDER", "ENTRY: EMA golden cross; round-trip costs considered", "accepted (simulated)"],
+    ["FILL", "ENTRY: EMA golden cross", "fee=632.17, realized=0"],
+    ["ORDER_STATUS", "Checking order status on the next cycle", "status=EXECUTED"],
+    ["MARKET", "Updated one-minute candles, order book, and indicators", "evaluated"],
   ] as const;
   const activities: ActivityItem[] = Array.from({ length: 42 }, (_, index) => {
     const template = templates[index % templates.length];
@@ -321,7 +321,7 @@ function demoSnapshot(): DashboardSnapshot {
       rsi: 25.75,
       smaShort: null,
       smaLong: null,
-      reason: "EMA短期 < EMA長期。RSI売られすぎ水準ですが、上昇トレンド条件を待機中",
+      reason: "EMA_short < EMA_long. RSI is oversold, but the uptrend condition is still pending",
     },
     settings: { maxSpreadRate: 0.001, riskPerTradeRate: 0.01, dailyLossLimitRate: 0.05 },
     pendingOrder: null,
@@ -403,7 +403,7 @@ export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSn
   ]);
   const latestMarket = activities.find((row) => row.event === "MARKET" && row.symbol === state.symbol);
   const latestRows = await (async () => {
-    // 市況の数値はAPI応答用に最新MARKET行だけを再取得せず、活動履歴とは別に保持する。
+    // Keep the latest MARKET row separate from activity history for market values in the API response.
     const names = (await listFiles(logDir(), /^decisions_\d{8}\.csv$/)).sort().reverse().slice(0, 2);
     for (const name of names) {
       try {
@@ -411,7 +411,7 @@ export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSn
         const market = rows.reverse().find((row) => row.event === "MARKET" && row.symbol === state.symbol);
         if (market) return market;
       } catch {
-        // 次の日別ファイルを確認する。
+        // Check the next daily file.
       }
     }
     return null;
@@ -478,8 +478,8 @@ export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSn
       emaShort: nullableNumber(latestRows.ema_short),
       emaLong: nullableNumber(latestRows.ema_long),
       rsi: nullableNumber(latestRows.rsi),
-      smaShort: nullableNumber(latestRows.reason?.match(/SMA短期=([\d.]+)/)?.[1]),
-      smaLong: nullableNumber(latestRows.reason?.match(/SMA長期=([\d.]+)/)?.[1]),
+      smaShort: nullableNumber(latestRows.reason?.match(/(?:SMA_short|SMA短期)=([\d.]+)/)?.[1]),
+      smaLong: nullableNumber(latestRows.reason?.match(/(?:SMA_long|SMA長期)=([\d.]+)/)?.[1]),
       reason: latestRows.reason || "",
     } : null,
     settings: {
@@ -488,7 +488,7 @@ export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSn
       dailyLossLimitRate: settings.dailyLossLimitRate,
     },
     pendingOrder: pending ? {
-      orderId: stringValue(pending.order_id, stringValue(pending.client_order_id, "照会中")),
+      orderId: stringValue(pending.order_id, stringValue(pending.client_order_id, "Pending lookup")),
       side: stringValue(pending.side),
       settleType: stringValue(pending.settle_type, "OPEN"),
       price: numberValue(pending.price),
