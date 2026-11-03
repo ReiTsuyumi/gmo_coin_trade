@@ -85,7 +85,7 @@ class BotTestCase(unittest.TestCase):
     def test_dotenv_is_required_and_overrides_os_environment(self):
         env_file = Path(self.temp.name) / ".env"
         with patch("gmo_trading_bot.ENV_FILE", env_file):
-            with self.assertRaisesRegex(ValueError, ".envが見つかりません"):
+            with self.assertRaisesRegex(ValueError, ".env not found"):
                 load_environment()
         env_file.write_text("DRY_RUN=true\nSYMBOL=ETH_JPY\n", encoding="utf-8")
         with patch.dict(os.environ, {"SYMBOL": "BTC_JPY"}):
@@ -106,7 +106,7 @@ class BotTestCase(unittest.TestCase):
         with patch.dict(os.environ, {"SYMBOLS": "BTC_JPY,BTC_JPY"}):
             from gmo_trading_bot import Config
             duplicate = Config.from_env()
-        with self.assertRaisesRegex(ValueError, "重複"):
+        with self.assertRaisesRegex(ValueError, "unique"):
             duplicate.validate()
 
     def test_signature_is_hmac_of_exact_compact_body(self):
@@ -190,6 +190,8 @@ class BotTestCase(unittest.TestCase):
         self.assertTrue(indicators.buy_signal)
         self.assertEqual(indicators.sma_short, Decimal("11"))
         self.assertEqual(indicators.sma_long, Decimal("32") / 3)
+        self.assertIn("SMA_short=11.00", indicators.reason)
+        self.assertTrue(indicators.reason.isascii())
 
         bearish_ha = make_candles([10, 10, 10, 10, 12], last_low=1)
         blocked = evaluate_ha_sma(bearish_ha, cfg)
@@ -224,8 +226,9 @@ class BotTestCase(unittest.TestCase):
     def test_fee_gate_uses_conservative_round_trip_cost(self):
         passed, reason = fee_gate(self.indicators, Decimal("100"), self.cfg)
         self.assertTrue(passed)
-        self.assertIn("maker往復cost", reason)
-        self.assertIn("taker往復cost", reason)
+        self.assertIn("maker_round_trip_cost", reason)
+        self.assertIn("conservative_taker_round_trip_cost", reason)
+        self.assertTrue(reason.isascii())
 
     def test_position_size_targets_500_yen_and_respects_step(self):
         cfg = replace(self.cfg, min_order_size=Decimal("0.01"), size_step=Decimal("0.01"))
@@ -243,7 +246,8 @@ class BotTestCase(unittest.TestCase):
             Decimal("1000000"), Decimal("50000"), Decimal("2000000"), cfg
         )
         self.assertEqual(size, Decimal("0"))
-        self.assertIn("この銘柄は取引しません", reason)
+        self.assertIn("skipping this symbol", reason)
+        self.assertTrue(reason.isascii())
 
     def test_minimum_below_2000_yen_is_allowed_even_above_target(self):
         cfg = replace(self.cfg, min_order_size=Decimal("0.01"), size_step=Decimal("0.01"))
@@ -251,7 +255,8 @@ class BotTestCase(unittest.TestCase):
             Decimal("1000000"), Decimal("50000"), Decimal("100000"), cfg
         )
         self.assertEqual(size, Decimal("0.01"))
-        self.assertIn("notional=1000.00円", reason)
+        self.assertIn("notional=1000.00 JPY", reason)
+        self.assertTrue(reason.isascii())
 
     def test_order_must_leave_3000_yen_available(self):
         size, _, reason = calculate_order_size(
@@ -338,9 +343,14 @@ class BotTestCase(unittest.TestCase):
         }
         bot.reconcile_dry_order(sell_book, self.indicators)
         self.assertEqual(bot.state.position_size, Decimal("0"))
-        # 売却額110 - 売却fee0.055 - 買付原価100.05 = 9.895円。
+        # Sale proceeds 110 - closing fee 0.055 - opening cost 100.05 = 9.895 JPY.
         self.assertEqual(bot.state.total_realized_pnl, Decimal("9.895"))
         self.assertIsNone(bot.state.pending_order)
+        csv_files = list(self.cfg.log_dir.glob("decisions_*.csv"))
+        self.assertEqual(len(csv_files), 1)
+        csv_text = csv_files[0].read_text(encoding="utf-8-sig")
+        self.assertTrue(csv_text.isascii())
+        self.assertIn("dry-run filled in full", csv_text)
 
     def test_dry_run_short_position_profits_when_price_falls(self):
         bot = TradingBot(self.cfg)
@@ -387,6 +397,7 @@ class BotTestCase(unittest.TestCase):
         self.assertEqual(pending["side"], "SELL")
         self.assertEqual(pending["price"], "500")
         self.assertIn("FORCED_LOSS_CUTOFF", pending["reason"])
+        self.assertTrue(pending["reason"].isascii())
 
     def test_profitable_long_is_held_in_uptrend(self):
         bot = TradingBot(self.cfg)
@@ -433,7 +444,7 @@ class BotTestCase(unittest.TestCase):
         bot = TradingBot(self.cfg)
         bot.state.position_size = Decimal("0.1")
         bot.state.position_cost = Decimal("100000")
-        with self.assertRaisesRegex(RuntimeError, "追加建玉を禁止します"):
+        with self.assertRaisesRegex(RuntimeError, "Additional positions are forbidden"):
             bot.submit_order(
                 side="BUY", price=Decimal("1000"), size=Decimal("0.1"), reason="test",
                 risk_budget=Decimal("1000"), book=Book(Decimal("999"), Decimal("1001")),
