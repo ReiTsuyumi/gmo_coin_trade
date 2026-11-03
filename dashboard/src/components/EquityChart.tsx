@@ -1,8 +1,8 @@
 import { useMemo, useState } from "react";
 import {
-  Area,
-  AreaChart,
   CartesianGrid,
+  Line,
+  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -52,7 +52,7 @@ export function EquityChart({ points }: { points: EquityPoint[] }) {
       {filtered.length >= 2 ? (
         <div className="chart-canvas" aria-label={`評価資産チャート。期間中の変化は${formatJpy(change)}です`}>
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={filtered} margin={{ top: 12, right: 8, left: 0, bottom: 0 }}>
+            <LineChart data={filtered} margin={{ top: 12, right: 8, left: 0, bottom: 0 }}>
               <CartesianGrid stroke="oklch(0.36 0.018 165)" vertical={false} strokeDasharray="2 6" />
               <XAxis
                 dataKey="time"
@@ -82,17 +82,16 @@ export function EquityChart({ points }: { points: EquityPoint[] }) {
                 labelFormatter={(value) => formatTime(String(value), true)}
                 formatter={(value) => [formatJpy(Number(value)), "評価資産"]}
               />
-              <Area
+              <Line
                 type="monotone"
                 dataKey="equity"
                 stroke="oklch(0.82 0.105 155)"
                 strokeWidth={2}
-                fill="oklch(0.82 0.105 155)"
-                fillOpacity={0.09}
+                dot={false}
                 activeDot={{ r: 4, fill: "oklch(0.82 0.105 155)", stroke: "oklch(0.155 0.014 165)" }}
                 isAnimationActive={false}
               />
-            </AreaChart>
+            </LineChart>
           </ResponsiveContainer>
         </div>
       ) : (
