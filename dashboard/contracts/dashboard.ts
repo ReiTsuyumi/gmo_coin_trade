@@ -1,6 +1,16 @@
 export type BotHealth = "running" | "stale" | "halted" | "waiting";
 export type DataSource = "bot" | "demo";
 
+export type BotStorageConnection = {
+  connected: boolean;
+  path: string;
+};
+
+export type BotStorage = {
+  data: BotStorageConnection;
+  logs: BotStorageConnection;
+};
+
 export type EquityPoint = {
   time: string;
   equity: number;
@@ -33,6 +43,7 @@ export type PendingOrderView = {
 export type DashboardSnapshot = {
   source: DataSource;
   generatedAt: string;
+  botStorage: BotStorage;
   bot: {
     symbol: string;
     availableSymbols: string[];

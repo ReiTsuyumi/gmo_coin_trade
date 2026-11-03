@@ -4,6 +4,8 @@ import path from "node:path";
 import { parse as parseEnv } from "dotenv";
 import type {
   ActivityItem,
+  BotStorage,
+  BotStorageConnection,
   DashboardSnapshot,
   EquityPoint,
 } from "@contracts/dashboard";
@@ -112,6 +114,24 @@ async function listFiles(directory: string, pattern: RegExp) {
   } catch {
     return [];
   }
+}
+
+async function checkStorageConnection(directory: string): Promise<BotStorageConnection> {
+  try {
+    // Reading the directory distinguishes an empty bot folder from a missing or unreadable one.
+    await fs.readdir(directory);
+    return { connected: true, path: directory };
+  } catch {
+    return { connected: false, path: directory };
+  }
+}
+
+async function checkBotStorage(): Promise<BotStorage> {
+  const [data, logs] = await Promise.all([
+    checkStorageConnection(dataDir()),
+    checkStorageConnection(logDir()),
+  ]);
+  return { data, logs };
 }
 
 async function readStates(): Promise<{ state: BotState; filePath: string; mtime: number }[]> {
@@ -246,7 +266,7 @@ function equitySeries(activities: ActivityItem[]): EquityPoint[] {
 }
 
 
-function demoSnapshot(): DashboardSnapshot {
+function demoSnapshot(botStorage: BotStorage): DashboardSnapshot {
   // Keep demo event timestamps stable across polling and manual refreshes.
   const now = DEMO_REFERENCE_TIME;
   const equityHistory: EquityPoint[] = Array.from({ length: 168 }, (_, index) => {
@@ -285,6 +305,7 @@ function demoSnapshot(): DashboardSnapshot {
   return {
     source: "demo",
     generatedAt: new Date().toISOString(),
+    botStorage,
     bot: {
       symbol: "BTC_JPY",
       availableSymbols: ["BTC_JPY"],
@@ -333,10 +354,16 @@ function demoSnapshot(): DashboardSnapshot {
   };
 }
 
-function waitingSnapshot(symbol: string, mode: string, settings: Awaited<ReturnType<typeof readPublicSettings>>): DashboardSnapshot {
+function waitingSnapshot(
+  symbol: string,
+  mode: string,
+  settings: Awaited<ReturnType<typeof readPublicSettings>>,
+  botStorage: BotStorage,
+): DashboardSnapshot {
   return {
     source: "bot",
     generatedAt: new Date().toISOString(),
+    botStorage,
     bot: {
       symbol,
       availableSymbols: settings.configuredSymbols,
@@ -378,22 +405,23 @@ function waitingSnapshot(symbol: string, mode: string, settings: Awaited<ReturnT
 }
 
 export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSnapshot> {
-  const [states, settings, officialSymbols] = await Promise.all([
+  const [states, settings, officialSymbols, botStorage] = await Promise.all([
     readStates(),
     readPublicSettings(),
     readOfficialSymbols(),
+    checkBotStorage(),
   ]);
   const availableSymbols = [...new Set([
     ...officialSymbols,
     ...settings.configuredSymbols,
     ...states.map((item) => item.state.symbol),
   ])];
-  if (!states.length && !availableSymbols.length) return demoSnapshot();
+  if (!states.length && !availableSymbols.length) return demoSnapshot(botStorage);
   const selected = availableSymbols.includes(symbol || "") ? symbol as string : availableSymbols[0];
   const latest = states.find((item) => item.state.symbol === selected);
 
   if (!latest) {
-    const snapshot = waitingSnapshot(selected, "dry-run", settings);
+    const snapshot = waitingSnapshot(selected, "dry-run", settings, botStorage);
     snapshot.bot.availableSymbols = availableSymbols;
     return snapshot;
   }
@@ -444,6 +472,7 @@ export async function getDashboardSnapshot(symbol?: string): Promise<DashboardSn
   return {
     source: "bot",
     generatedAt: new Date().toISOString(),
+    botStorage,
     bot: {
       symbol: state.symbol,
       availableSymbols,
