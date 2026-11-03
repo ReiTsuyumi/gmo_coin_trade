@@ -50,7 +50,7 @@ export type DashboardSnapshot = {
     mode: string;
     health: BotHealth;
     updatedAt: string;
-    loopSeconds: number;
+    tradeCron: string;
     dailyHalted: boolean;
   };
   account: {
