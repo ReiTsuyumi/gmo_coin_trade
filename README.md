@@ -33,7 +33,7 @@ python -m unittest -v test_gmo_trading_bot.py
 python gmo_trading_bot.py --once
 ```
 
-継続実行は次のコマンドです。
+継続実行は次のコマンドです。`.env`の5項目形式`TRADE_CRON`で指定した日本時間に判定し、既定の`0 * * * *`では毎時0分に全銘柄を順次処理します。`--once`はcron時刻を待たずに即時確認できます。
 
 ```bash
 python gmo_trading_bot.py
