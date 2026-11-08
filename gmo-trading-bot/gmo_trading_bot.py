@@ -1224,7 +1224,7 @@ class TradingBot:
     def candles(self, now: datetime) -> list[dict[str, Decimal]]:
         day = gmo_kline_day(now)
         per_day = 86_400_000 // KLINE_INTERVAL_MS[self.cfg.kline_interval]
-        days_needed = max(2, (self.cfg.kline_count + per_day - 1) // per_day + 1)
+        days_needed = max(2, (self.cfg.kline_count + per_day - 1) // per_day + 3)
         all_candles: list[dict[str, Decimal]] = []
         for offset in range(days_needed - 1, -1, -1):
             rows = self.client.klines((day - timedelta(days=offset)).strftime("%Y%m%d"))
