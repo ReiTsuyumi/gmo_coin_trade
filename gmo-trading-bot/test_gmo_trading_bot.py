@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from gmo_trading_bot import (
-    GMOAPIError, GMOClient, TradingBot, Book, BotState, Indicators,
+    GMOAPIError, GMOClient, RequestLimiter, SymbolRuleCache, TradingBot, Book, BotState, Indicators,
     calculate_order_size, evaluate_ha_sma, evaluate_strategy,
     extract_closed_candles, extract_closed_closes, fee_gate, heikin_ashi,
     improved_limit_price, load_environment, next_cron_time, parse_book, rsi_wilder, run_loop,
@@ -25,6 +25,16 @@ class FakeResponse:
 
     def json(self):
         return {"status": 0, "data": 123456}
+
+
+class JsonResponse:
+    def __init__(self, result, status_code=200):
+        self.result = result
+        self.status_code = status_code
+        self.text = json.dumps(result)
+
+    def json(self):
+        return self.result
 
 
 class FakeSession:
@@ -156,6 +166,69 @@ class BotTestCase(unittest.TestCase):
         expected = hmac.new(b"test-secret", expected_text.encode(), hashlib.sha256).hexdigest()
         self.assertEqual(headers["API-SIGN"], expected)
         self.assertIsNone(kwargs["data"])
+
+    def test_symbol_rules_are_shared_across_symbol_clients(self):
+        cache = SymbolRuleCache()
+        limiter = RequestLimiter(0)
+        rows = [
+            {"symbol": "BTC_JPY", "tickSize": "1"},
+            {"symbol": "SUI_JPY", "tickSize": "0.1"},
+        ]
+        sessions = []
+        for symbol in ("BTC_JPY", "SUI_JPY"):
+            client = GMOClient(
+                replace(self.cfg, symbol=symbol),
+                request_limiter=limiter,
+                symbol_cache=cache,
+            )
+            client.session = Mock()
+            client.session.headers = {}
+            client.session.request.return_value = JsonResponse({"status": 0, "data": rows})
+            sessions.append(client.session)
+            self.assertEqual(client.symbol_rule()["symbol"], symbol)
+        self.assertEqual(sessions[0].request.call_count, 1)
+        self.assertEqual(sessions[1].request.call_count, 0)
+
+    def test_rate_limited_get_waits_and_retries(self):
+        client = GMOClient(self.cfg, request_limiter=RequestLimiter(0))
+        client.session = Mock()
+        client.session.headers = {}
+        client.session.request.side_effect = [
+            JsonResponse({
+                "status": 1,
+                "messages": [{"message_code": "ERR-5003", "message_string": "Requests are too many."}],
+            }),
+            JsonResponse({"status": 0, "data": []}),
+        ]
+        with patch("gmo_trading_bot.time.sleep") as sleep:
+            self.assertEqual(client._request("GET", "public", "/v1/symbols"), [])
+        self.assertEqual(client.session.request.call_count, 2)
+        sleep.assert_called_once_with(1.0)
+
+    def test_rate_limited_post_is_never_retried(self):
+        client = GMOClient(self.cfg, request_limiter=RequestLimiter(0))
+        client.session = Mock()
+        client.session.headers = {}
+        client.session.request.return_value = JsonResponse({
+            "status": 1,
+            "messages": [{"message_code": "ERR-5003", "message_string": "Requests are too many."}],
+        })
+        with patch("gmo_trading_bot.time.sleep") as sleep:
+            with self.assertRaises(GMOAPIError):
+                client._request("POST", "private", "/v1/cancelOrder", payload={"orderId": 1})
+        self.assertEqual(client.session.request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_symbol_rule_cache_uses_last_good_response_after_refresh_failure(self):
+        cache = SymbolRuleCache()
+        loader = Mock(side_effect=[
+            [{"symbol": "BTC_JPY"}],
+            GMOAPIError("rate limited"),
+        ])
+        self.assertEqual(cache.get(loader), [{"symbol": "BTC_JPY"}])
+        cache._fetched_at = 0
+        self.assertEqual(cache.get(loader), [{"symbol": "BTC_JPY"}])
+        self.assertEqual(loader.call_count, 2)
 
     def test_orderbook_mid_and_spread(self):
         book = parse_book({
@@ -462,6 +535,36 @@ class BotTestCase(unittest.TestCase):
         self.assertEqual(body["settlePosition"], {"positionId": 123, "size": "0.1"})
         self.assertEqual(body["side"], "BUY")
 
+    def test_open_order_omits_exchange_losscut_price(self):
+        client = GMOClient(self.cfg)
+        fake = FakeSession()
+        client.session = fake
+        client.place_limit_order("BUY", Decimal("1000"), Decimal("0.1"), "client-id")
+        body = json.loads(fake.calls[0][2]["data"])
+        self.assertNotIn("losscutPrice", body)
+
+    def test_live_open_order_leaves_forced_loss_close_to_the_bot(self):
+        bot = TradingBot(replace(self.cfg, dry_run=False))
+        bot.client.place_limit_order = Mock(return_value="123")
+        bot.submit_order(
+            side="BUY", price=Decimal("1000"), size=Decimal("0.1"), reason="test",
+            risk_budget=Decimal("1000"), book=Book(Decimal("999"), Decimal("1001")),
+            indicators=self.indicators, equity=Decimal("1000000"),
+            available_jpy=Decimal("1000000"), available_base=Decimal("0"),
+        )
+        bot.client.place_limit_order.assert_called_once()
+        self.assertEqual(len(bot.client.place_limit_order.call_args.args), 4)
+        self.assertNotIn("losscut_price", bot.client.place_limit_order.call_args.kwargs)
+
+    def test_forced_loss_estimate_uses_actual_entry_and_both_fees(self):
+        bot = TradingBot(self.cfg)
+        bot.state.position_size = Decimal("0.1")
+        bot.state.position_side = "BUY"
+        bot.state.position_entry_price = Decimal("1000")
+        bot.state.position_entry_fee = Decimal("0.05")
+        pnl = bot.estimated_close_pnl(Book(Decimal("900"), Decimal("901")))
+        self.assertEqual(pnl, Decimal("-10.09500"))
+
     def test_existing_position_never_allows_another_open(self):
         bot = TradingBot(self.cfg)
         bot.state.position_size = Decimal("0.1")
@@ -510,8 +613,10 @@ class BotTestCase(unittest.TestCase):
             bot = Mock()
             bot.cfg = replace(cfg, symbol=symbol)
             bots.append(bot)
-        with patch("gmo_trading_bot.TradingBot", side_effect=bots):
+        with patch("gmo_trading_bot.TradingBot", side_effect=bots) as constructor:
             run_loop(cfg, once=True)
+        self.assertEqual(len({call.kwargs["symbol_cache"] for call in constructor.call_args_list}), 1)
+        self.assertEqual(len({call.kwargs["request_limiter"] for call in constructor.call_args_list}), 1)
         for bot in bots:
             bot.run_once.assert_called_once_with()
             bot.cancel_pending_on_exit.assert_not_called()
