@@ -46,6 +46,8 @@ JST = ZoneInfo("Asia/Tokyo")
 ACTIVE_ORDER_STATUSES = {"WAITING", "ORDERED", "MODIFYING", "CANCELLING"}
 FINAL_ORDER_STATUSES = {"CANCELED", "EXECUTED", "EXPIRED"}
 LOGGER = logging.getLogger("gmo_bot")
+REQUEST_INTERVAL_SECONDS = 0.2
+SYMBOL_RULE_CACHE_SECONDS = 300.0
 
 
 def dec(value: Any) -> Decimal:
@@ -112,6 +114,14 @@ def ceil_step(value: Decimal, step: Decimal) -> Decimal:
 
 class GMOAPIError(RuntimeError):
     """Raised when the HTTP/API response explicitly reports failure."""
+
+
+def is_rate_limit_error(result: dict[str, Any]) -> bool:
+    messages = result.get("messages", [])
+    return any(
+        isinstance(message, dict) and message.get("message_code") == "ERR-5003"
+        for message in messages
+    )
 
 
 @dataclass(frozen=True)
@@ -286,14 +296,66 @@ class Config:
                 raise ValueError("LIVE_TRADING_ACK=I_UNDERSTAND_REAL_ORDERS is required in live mode")
 
 
+class RequestLimiter:
+    """Serialize request start times across all symbol-specific clients."""
+
+    def __init__(self, interval_seconds: float = REQUEST_INTERVAL_SECONDS):
+        self.interval_seconds = interval_seconds
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_request_at - now)
+            self._next_request_at = max(now, self._next_request_at) + self.interval_seconds
+        if delay > 0:
+            time.sleep(delay)
+
+
+class SymbolRuleCache:
+    """Share the all-symbol response and retain the last good rules during API failures."""
+
+    def __init__(self, ttl_seconds: float = SYMBOL_RULE_CACHE_SECONDS):
+        self.ttl_seconds = ttl_seconds
+        self._rows: Optional[list[dict[str, Any]]] = None
+        self._fetched_at = 0.0
+        self._lock = threading.Lock()
+
+    def get(self, loader: Any) -> list[dict[str, Any]]:
+        with self._lock:
+            if self._rows is not None and time.monotonic() - self._fetched_at < self.ttl_seconds:
+                return self._rows
+            try:
+                rows = loader()
+                if not rows:
+                    raise ValueError("The public symbols response was empty")
+                self._rows = rows
+                self._fetched_at = time.monotonic()
+                return rows
+            except Exception:
+                if self._rows is None:
+                    raise
+                LOGGER.warning("Could not refresh symbol rules; using the last successful response")
+                return self._rows
+
+
 class GMOClient:
     PUBLIC_BASE = "https://api.coin.z.com/public"
     PRIVATE_BASE = "https://api.coin.z.com/private"
 
-    def __init__(self, cfg: Config):
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        request_limiter: Optional[RequestLimiter] = None,
+        symbol_cache: Optional[SymbolRuleCache] = None,
+    ):
         self.cfg = cfg
         self.api_key = os.getenv("GMO_API_KEY", "")
         self.secret = os.getenv("GMO_API_SECRET", "")
+        self.request_limiter = request_limiter or RequestLimiter()
+        self.symbol_cache = symbol_cache or SymbolRuleCache()
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "gmo-leverage-risk-bot/2.0"})
 
@@ -327,6 +389,7 @@ class GMOClient:
         last_error: Optional[BaseException] = None
         for attempt in range(attempts):
             try:
+                self.request_limiter.wait()
                 response = self.session.request(
                     method,
                     base + path,
@@ -335,8 +398,10 @@ class GMOClient:
                     headers=headers,
                     timeout=self.cfg.request_timeout_seconds,
                 )
-                if response.status_code >= 500 and method == "GET" and attempt + 1 < attempts:
-                    time.sleep(0.5 * (2 ** attempt))
+                retryable_http = response.status_code == 429 or response.status_code >= 500
+                if retryable_http and method == "GET" and attempt + 1 < attempts:
+                    delay = 1.0 if response.status_code == 429 else 0.5
+                    time.sleep(delay * (2 ** attempt))
                     continue
                 if response.status_code != 200:
                     message = f"HTTP {response.status_code}: {response.text[:500]}"
@@ -346,6 +411,14 @@ class GMOClient:
                     raise GMOAPIError(message)
                 result = response.json()
                 if result.get("status") != 0:
+                    if is_rate_limit_error(result) and method == "GET" and attempt + 1 < attempts:
+                        delay = 1.0 * (2 ** attempt)
+                        LOGGER.warning(
+                            "GMO API rate limit reached for GET %s; retrying in %.1f seconds",
+                            path, delay,
+                        )
+                        time.sleep(delay)
+                        continue
                     raise GMOAPIError(
                         f"GMO API error: {result.get('messages', result.get('message', result))}"
                     )
@@ -383,7 +456,9 @@ class GMOClient:
         return data.get("list", [])
 
     def symbol_rule(self) -> dict[str, Any]:
-        rows = self._request("GET", "public", "/v1/symbols") or []
+        rows = self.symbol_cache.get(
+            lambda: self._request("GET", "public", "/v1/symbols") or []
+        )
         for row in rows:
             if row.get("symbol") == self.cfg.symbol:
                 return row
@@ -401,7 +476,6 @@ class GMOClient:
 
     def place_limit_order(
         self, side: str, price: Decimal, size: Decimal, client_order_id: str,
-        losscut_price: Optional[Decimal] = None,
     ) -> str:
         payload = {
             "symbol": self.cfg.symbol,
@@ -412,8 +486,6 @@ class GMOClient:
             "size": decimal_text(size),
             "clientOrderId": client_order_id,
         }
-        if losscut_price is not None:
-            payload["losscutPrice"] = decimal_text(losscut_price)
         data = self._request("POST", "private", "/v1/order", payload=payload)
         return str(data)
 
@@ -873,9 +945,17 @@ def calculate_order_size(
 
 
 class TradingBot:
-    def __init__(self, cfg: Config):
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        request_limiter: Optional[RequestLimiter] = None,
+        symbol_cache: Optional[SymbolRuleCache] = None,
+    ):
         self.cfg = cfg
-        self.client = GMOClient(cfg)
+        self.client = GMOClient(
+            cfg, request_limiter=request_limiter, symbol_cache=symbol_cache
+        )
         self.state = BotState.load(cfg)
         self.audit = AuditLogger(cfg)
 
@@ -1193,13 +1273,9 @@ class TradingBot:
         try:
             if not self.cfg.dry_run:
                 if settle_type == "OPEN":
-                    losscut = price * (
-                        D1 - self.cfg.stop_distance_rate if side == "BUY"
-                        else D1 + self.cfg.stop_distance_rate
-                    )
-                    losscut = floor_step(losscut, self.cfg.price_tick)
+                    # The bot closes from actual fills and fee-adjusted PnL; do not set exchange losscutPrice.
                     pending["order_id"] = self.client.place_limit_order(
-                        side, price, size, client_order_id, losscut
+                        side, price, size, client_order_id
                     )
                 else:
                     pending["order_id"] = self.client.place_close_limit_order(
@@ -1304,8 +1380,8 @@ class TradingBot:
             self.state.save(self.cfg)
             return
 
-        # Close at -50 JPY or less before all other filters, without market orders.
-        # Sell long positions at best_bid and buy back short positions at best_ask.
+        # Close at the configured absolute loss or less before all other filters, without market orders.
+        # Use actual entry fills and both fees; sell longs at best_bid and buy back shorts at best_ask.
         forced_loss = (
             self.state.position_size > 0
             and self.estimated_close_pnl(book) <= -self.cfg.absolute_loss_cutoff
@@ -1477,7 +1553,16 @@ class SingleInstance:
 
 
 def run_loop(cfg: Config, once: bool) -> None:
-    bots = [TradingBot(replace(cfg, symbol=symbol)) for symbol in cfg.symbols]
+    request_limiter = RequestLimiter()
+    symbol_cache = SymbolRuleCache()
+    bots = [
+        TradingBot(
+            replace(cfg, symbol=symbol),
+            request_limiter=request_limiter,
+            symbol_cache=symbol_cache,
+        )
+        for symbol in cfg.symbols
+    ]
     stop_event = threading.Event()
 
     def request_stop(signum: int, _: Any) -> None:
